@@ -1,0 +1,23 @@
+{
+  "name": "@fireos-inox/core",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Platform-free FireOS-Inox client core: Inox protocol types, API client, RoomSocket, sync maths, room store.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --project unit",
+    "test:l2": "vitest run --project l2",
+    "test:all": "vitest run",
+    "test:watch": "vitest --project unit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.30",
+    "typescript": "5.8.3",
+    "vitest": "4.1.11"
+  }
+}

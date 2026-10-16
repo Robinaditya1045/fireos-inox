@@ -1,4 +1,4 @@
-import { isPlaybackPayload, PLAYBACK_EVENTS, type MediaKind, type WSMessage } from './protocol';
+import { isLiveLeaderPayload, isPlaybackPayload, PLAYBACK_EVENTS, type MediaKind, type WSMessage } from './protocol';
 
 /**
  * The room's playback position as an anchor ("position X at local time T"), extrapolated on
@@ -114,6 +114,11 @@ export function driftAction(drift: number): { rate: number; seek: boolean } {
  */
 export function nextLead(lead: number, residualDrift: number): number {
   return Math.min(2, Math.max(0, lead + 0.8 * residualDrift));
+}
+
+/** The TV can't produce live positions, so it must hand back any leadership it is given, or the live room stalls. */
+export function shouldDeclineLeadership(msg: WSMessage, myUserId: string): boolean {
+  return msg.type === 'LIVE_LEADER' && isLiveLeaderPayload(msg.payload) && msg.payload.leader_id === myUserId;
 }
 
 /** Payload that hands live-sync leadership back (ws/live.go reassigns on `unable`). */

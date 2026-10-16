@@ -22,11 +22,11 @@ FireOS-Inox is a Fire TV client, targeting **Vega OS** with **React Native for V
 8. **Reviewer-facing material lives outside `/docs`:** `README.md`, `AWS_BUILDER.md`, `LICENSE`, `kiro-crew/`. Setup or run steps written only in `docs/` are invisible to reviewers.
 
 ## Layout (current; target in `docs/dev/architecture.md`)
-- `packages/core/src`: platform-free TypeScript: `protocol.ts` (Inox wire types + guards), `api.ts`, `roomSocket.ts`, `sync.ts`, `logger.ts`. It must not import `react-native`, `@amazon-devices/*`, hls.js or globals; `fetch`, `WebSocket`, timers, `now()` and the logger are injected so core runs unchanged under Node tests, the mock and a future Fire OS shell. It has **no `package.json` or tsconfig yet**: the app imports it by relative path (`../../../../packages/core/src`) and Metro bundles it through `watchFolders` (D9). So core is typechecked only as far as the app imports it. The planned room store isn't extracted yet; room-session logic lives in `apps/vega/src/screens/RoomScreen.tsx`.
+- `packages/core/src`: platform-free TypeScript: `protocol.ts` (Inox wire types + guards), `api.ts`, `roomSocket.ts`, `sync.ts`, `room.ts` (room store: `roomReducer` + `createRoomSession`), `logger.ts`. It must not import `react-native`, `@amazon-devices/*`, hls.js or globals; `fetch`, `WebSocket`, timers, `now()` and the logger are injected so core runs unchanged under Node tests, the mock and a future Fire OS shell. Its `package.json` holds only test tooling (Vitest 4.1.11, D11; `.npmrc` sets `legacy-peer-deps`) and a strict tsconfig (`noUncheckedIndexedAccess`). The app imports core by relative path (`../../../../packages/core/src`) and Metro bundles it through `watchFolders` (D9); `metro.config.js` block-lists core's `node_modules/` and `test/`, so **core must keep zero runtime dependencies**. `createRoomSession` isn't wired into the app yet: `apps/vega/src/screens/RoomScreen.tsx` still has its own copy of the room logic from the M0 spike (wire it in M3).
 - `apps/vega`: generated from the Vega RN 0.83 template (app id `com.fireosinox.tv`). `App.tsx` switches between the SignIn, Lobby and Room screens (no navigation library yet). `platform/services.ts` wires core's `createApi` to the app's config and an in-memory session (AsyncStorage persistence is M2). `platform/config.generated.ts` is git-ignored and written by `scripts/write-app-config.mjs`. All UI values come from `theme/tokens.ts`.
 - `apps/vega/src/player/VegaPlayer.ts` is our PlayerAdapter. It wraps Amazon's sample `hlsjsplayer/` (`HlsJsPlayer.ts`, polyfills, `dist/hls.mjs`), plus the root `PlayerBase.ts`/`PlayerInterface.ts`. Keep fixes in `VegaPlayer.ts` rather than the vendored files. `dist/hls.mjs` is marked Amazon proprietary/confidential, so check its licence before the repo goes public.
 - `tools/sync-probe/probe.mjs`: scripted room participant (`--as host|tv listen|send|script`), reading `.devstack/seed-*.json`. `tools/validate/`: M0 validation harness (browser host driver, sync analyser, network-kill, D-pad walk). `tools/devlog/devlog.mjs`: streams app JS logs from the Metro inspector.
-- `tools/mock-inox` (planned, M1): mock backend with failure injection (`--control` → `POST /__control/{scenario}`); also the reviewer-runnable backend. Every faked behaviour must cite the Inox source file it mirrors.
+- `tools/mock-inox/src/mock.mjs`: mock backend (`startMock()`; the CLI is `src/cli.mjs`, default port 18090) with failure injection (`--control` → `POST /__control/{scenario}`, `GET /__control/events`); also the reviewer-runnable backend. Every faked behaviour must cite the Inox source file it mirrors. The L2 suite starts it in-process on a random port.
 - `devstack/`, `scripts/`: local Inox stack from a read-only snapshot (`scripts/lib.sh` holds shared paths and `load_env`); runtime state, logs and evidence go in `.devstack/` (git-ignored).
 
 ## Architecture essentials
@@ -39,7 +39,9 @@ These span several docs (`architecture.md`, `inox-contract.md`, `testing.md`) an
 - **Live media is out of scope:** show a notice and decline leadership by sending `LIVE_POSITION {unable:true}` when `LIVE_LEADER` names the TV user, or the live room stalls.
 - **RoomSocket reconnects forever** while the room screen is mounted (1 s → 15 s backoff, ±20 % jitter, reset after 10 s open), checking `api.me()` first so a 401 routes to Sign-in.
 
-## Status (2026-10-16, end of validation session)
+## Status (2026-10-16)
+**M1 done** (core package + Vitest + mock + L2; see `docs/dev/session-log.md`). Next: M2 sign-in persistence and lobby, and wiring `createRoomSession` into `RoomScreen`. R17 is still open.
+
 M0 spike done on VVD (Vega SDK 0.24.12112, CLI 1.4.4, RN 0.83 template, Zorin host works). Spike committed as `ba1d143`. Repo stays **private** for now (decision D12). Validation results:
 - ✅ VVD boots, app runs · ✅ login + authenticated WS open 334 s with no reconnect · ✅ hls.js plays the Inox 1080/720/480 ladder and switches renditions · ✅ network loss → reconnect (backoff) → resync (0.03 s drift 6.4 s after restore) · ✅ chat panel, member-control toast.
 - ⚠️ Browser PLAY/PAUSE/SEEK reach the TV in ~50 ms; TV median drift vs room ~0.04 s, but VVD's player sometimes jumps ~5 s ahead on play/after seeks (friction F6) → 3–7 s excursions before correction. Partial.
@@ -65,7 +67,9 @@ Confirmed working on 2026-10-16:
 - Lint: `cd apps/vega && npx eslint src --ext .ts,.tsx` (0 errors; the system-distributed-library warnings are expected). `npm run lint` fails until an `apps/vega/test/` folder exists, because its glob includes `test`.
 - Drive/inspect VVD: `scripts/vvd.sh key KEY_DOWN …`, `scripts/vvd.sh shot <name>`.
 - Validation: web client from snapshot on :15173 (see local-stack.md §8), `node tools/validate/browser-host.mjs tools/validate/sync-script.json`, `node tools/validate/analyze-sync.mjs <web.log> .devstack/logs/app-all.log`, `tools/validate/netkill.sh`, `node tools/sync-probe/probe.mjs send|listen|script`.
-- Core tests: none yet (M1; Vitest proposed, D11). Layout decided: standalone npm app + Metro `watchFolders` (D9).
+- Core (verified 2026-10-16, run in `packages/core`): `npm run typecheck`, `npm test` (L1 unit), `npm run test:l2` (L2: core against the mock over localhost), `npm run test:all`. Single test: `npx vitest run test/sync.test.ts -t "PLAY adds"`.
+- Mock: `cd tools/mock-inox && npm install && node src/cli.mjs --control` (password: `MOCK_PASSWORD` or `mock-only-password`). HLS fixture: `scripts/make-hls-fixture.sh` (ffmpeg; synthetic, git-ignored).
+- After changing `metro.config.js`, restart Metro: it was started detached, with output to `.devstack/logs/metro.log`.
 
 ## Working agreement
 - Milestones run in order (`docs/dev/roadmap.md`). M0 is a go/no-go gate.

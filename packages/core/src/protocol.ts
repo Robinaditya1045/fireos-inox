@@ -160,6 +160,17 @@ export function isChatPayload(p: unknown): p is ChatPayload {
   return typeof p === 'object' && p !== null && typeof (p as ChatPayload).message === 'string';
 }
 
+export function isSfuPeersPayload(p: unknown): p is { peers: SfuPeer[] | null } {
+  if (typeof p !== 'object' || p === null) return false;
+  const peers = (p as { peers?: unknown }).peers;
+  // Go encodes an empty roster slice as null (contract §6).
+  return peers === null || (Array.isArray(peers) && peers.every((x) => typeof x === 'object' && x !== null && typeof (x as SfuPeer).user_id === 'string'));
+}
+
+export function isLiveLeaderPayload(p: unknown): p is LiveLeaderPayload {
+  return typeof p === 'object' && p !== null && typeof (p as LiveLeaderPayload).leader_id === 'string';
+}
+
 export function parseMessage(raw: string): WSMessage | null {
   try {
     const m = JSON.parse(raw) as WSMessage;
