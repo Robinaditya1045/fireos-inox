@@ -64,6 +64,12 @@ export class VegaPlayer {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retryAttempt = 0;
   private hls: HlsJsPlayer | null = null;
+  /** The hls.js instance our listeners are on; HlsJsPlayer reuses one instance across loads. */
+  private listening: unknown = null;
+  private url: string | null = null;
+  private surface: string | null = null;
+  private resetting = false;
+  private hlsConfig: Record<string, unknown> = {};
   private ready = false;
   private readyListeners: Array<() => void> = [];
   private levelListeners: Array<(l: LevelInfo) => void> = [];
@@ -87,9 +93,12 @@ export class VegaPlayer {
     );
   }
 
-  load(url: string): void {
+  /** `hlsConfig` overrides the sample's hls.js settings (read live by hls.js; used by the player lab). */
+  load(url: string, hlsConfig: Record<string, unknown> = {}): void {
     if (!this.video) return;
     this.ready = false;
+    this.url = url;
+    this.hlsConfig = hlsConfig;
     if (this.hls) {
       void this.hls.unload();
     } else {
@@ -97,6 +106,10 @@ export class VegaPlayer {
     }
     this.hls.load({secure: 'false', uri: url, drm_scheme: '', drm_license_uri: ''}, false);
     const hls = this.hls.player;
+    Object.assign(hls.config, hlsConfig);
+    logger.info('player', 'load', {url});
+    if (this.listening === hls) return;
+    this.listening = hls;
     hls.on(HlsLib.Events.LEVEL_SWITCHED, (_e, data) => {
       const level = hls.levels?.[data.level];
       const info = {index: data.level, height: level?.height ?? 0, bitrate: level?.bitrate ?? 0};
@@ -119,8 +132,8 @@ export class VegaPlayer {
     hls.on(HlsLib.Events.FRAG_LOADED, () => {
       this.retryAttempt = 0;
     });
-    logger.info('player', 'load', {url});
   }
+
 
   private scheduleRetry(): void {
     if (this.retryTimer) return;
@@ -141,11 +154,45 @@ export class VegaPlayer {
   }
 
   attachSurface(handle: string): void {
+    this.surface = handle;
     this.video?.setSurfaceHandle(handle);
   }
 
   detachSurface(handle: string): void {
+    if (this.surface === handle) this.surface = null;
     this.video?.clearSurfaceHandle(handle);
+  }
+
+  /**
+   * Rebuilds the media element and hls.js from scratch and reloads the current stream; onReady
+   * listeners fire again once it is back. On VVD a player that raced or wedged after a resume (R17)
+   * came back 2/2 this way, against 0/2 for reloading into the same element and 1/2 for
+   * hls.recoverMediaError() (player lab, .devstack/evidence/lab-inox-recovery.txt).
+   */
+  async reset(): Promise<void> {
+    if (this.resetting) return;
+    this.resetting = true;
+    const url = this.url;
+    logger.warn('player', 'resetting media element', {url});
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    try {
+      await this.hls?.destroy();
+      await this.video?.deinitialize();
+    } catch (err) {
+      logger.warn('player', 'reset teardown failed', {err: String(err)});
+    }
+    this.hls = null;
+    this.listening = null;
+    this.video = null;
+    this.ready = false;
+    try {
+      await this.init();
+      if (this.surface) this.video?.setSurfaceHandle(this.surface);
+      if (url) this.load(url, this.hlsConfig);
+    } finally {
+      this.resetting = false;
+    }
   }
 
   isReady(): boolean {
@@ -231,6 +278,11 @@ export class VegaPlayer {
   setLevel(index: number): void {
     const hls = this.hls?.player;
     if (hls) hls.currentLevel = index;
+  }
+
+  /** Raw handles for dev instrumentation (src/dev/PlayerLab.tsx) only. */
+  debugHandles(): {video: VideoPlayer | null; hls: unknown; Events: typeof HlsLib.Events} {
+    return {video: this.video, hls: this.hls?.player ?? null, Events: HlsLib.Events};
   }
 
   async destroy(): Promise<void> {

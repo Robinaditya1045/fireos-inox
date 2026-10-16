@@ -1,5 +1,7 @@
 import React, {useEffect, useState} from 'react';
 import type {Room, Session} from '../../../packages/core/src';
+import {PlayerLab} from './dev/PlayerLab';
+import {config} from './platform/config';
 import {logger} from './platform/logger';
 import {auth} from './platform/services';
 import {LobbyScreen} from './screens/LobbyScreen';
@@ -8,7 +10,9 @@ import {SignInScreen} from './screens/SignInScreen';
 
 type Screen = {name: 'signin'; notice?: string} | {name: 'lobby'} | {name: 'room'; room: Room};
 
-export const App = () => {
+export const App = () => (config.playerLab ? <PlayerLab {...config.playerLab} /> : <WatchParty />);
+
+const WatchParty = () => {
   const [session, setSession] = useState<Session | null>(auth.get());
   const [screen, setScreen] = useState<Screen>({name: 'signin'});
 

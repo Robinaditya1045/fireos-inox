@@ -3,24 +3,18 @@ import {BackHandler, StyleSheet, Text, View} from 'react-native';
 import {KeplerVideoSurfaceView} from '@amazon-devices/react-native-w3cmedia';
 import {useTVEventHandler, type HWEvent} from '@amazon-devices/react-native-kepler';
 import {
-  applyLocal,
-  applyRemote,
-  clockOffsetFromSync,
-  declineLeadershipPayload,
-  driftAction,
+  correction,
+  createRoomSession,
+  DRIFT_SEEK_THRESHOLD_S,
   expectedPosition,
-  fromSync,
-  isChatPayload,
-  isOwnEcho,
   RoomSocket,
   SETTLE_MS,
-  type LiveLeaderPayload,
   type PlaybackState,
   type Room,
+  type RoomSession,
+  type RoomSessionState,
   type Session,
-  type SfuPeer,
-  type SocketState,
-  type WSMessage,
+  type WebSocketCtor,
 } from '../../../../packages/core/src';
 import {config} from '../platform/config';
 import {logger} from '../platform/logger';
@@ -29,8 +23,8 @@ import {VegaPlayer, type LevelInfo} from '../player/VegaPlayer';
 import {color, font, radius, space} from '../theme/tokens';
 
 const DRIFT_CHECK_MS = 1000;
-/** Resume in place (rate ladder closes the rest) when within this; beyond it, seek-ahead-and-hold. */
-const APPLY_SEEK_TOLERANCE_S = 1.5;
+/** A paused player further off than this is re-pinned. */
+const PAUSED_REPIN_S = 1.5;
 const SEEK_STEP_S = 10;
 const LEVEL_CYCLE = [-1, 0, 1, 2];
 
@@ -40,49 +34,46 @@ const LEVEL_CYCLE = [-1, 0, 1, 2];
  */
 const seekReady = {ewma: 2.0};
 /**
- * On VVD a seek made while paused, followed by play() seconds later, resumes ~5.6 s AHEAD of the
- * seek target and then stalls — even inside a buffered range (seen 3×: 79.2 → 84.8/85.0 s). A
- * hold (pause → seek → play ~1 s later) is fine. So pausing never seeks unless the TV is far off;
- * the small remaining gap is closed by the rate ladder after resume.
+ * R17/F6: on VVD, a plain play() on a paused player may race the playhead seconds ahead and then
+ * wedge it (player lab: 1 in 3 plain resumes after a 20 s pause; in the room, a resume 0.2 s after a
+ * paused seek still raced). A hold — seek, wait for buffer, then play — never did (6/6 in the lab,
+ * every hold in the room). So a paused player is only ever started through a hold.
  */
-const PAUSED_PIN_TOLERANCE_S = 1.5;
+const PAUSED_PIN_TOLERANCE_S = 0.1;
 const HOLD_POLL_MS = 100;
 /** Seconds buffered ahead of the playhead before playback may (re)start without stalling. */
 const MIN_BUFFER_AHEAD_S = 2;
 const HOLD_TIMEOUT_MS = 10_000;
 /** Grace after starting playback before drift is measured again. */
 const START_SETTLE_MS = 1000;
+/**
+ * R17 watchdog. A racing playhead (far faster than the wall clock) wedges next; a wedged one
+ * (playing, buffered, frozen) is not cleared by seeks. Either way the media element is rebuilt
+ * (VegaPlayer.reset), the only recovery that worked every time in the player lab.
+ */
+const STALL_MS = 2000;
+const RACE_EXCESS_S = 1.0;
 
-interface ChatLine {
-  id: string;
-  name: string;
-  text: string;
-}
+const LIVE_NOTICE = "Live channels aren't available on TV yet";
 
 export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Session; onLeave: () => void}) => {
   const player = useRef<VegaPlayer | null>(null);
-  const socket = useRef<RoomSocket | null>(null);
+  const roomSession = useRef<RoomSession | null>(null);
   const state = useRef<PlaybackState | null>(null);
   const loadedUrl = useRef<string | null>(null);
   const settleUntil = useRef(0);
-  const canControlRef = useRef(false);
   const pendingSurface = useRef<string | null>(null);
   const levelCycle = useRef(0);
-  /** Device clock minus server clock, refreshed from every SYNC_PLAYBACK. */
-  const clockOffset = useRef(0);
   /** Bumped by every align(); a stale hold sequence checks it and stops. */
   const alignGen = useRef(0);
   /** True while a seek-ahead-and-hold is in progress; the drift loop stays out of the way. */
   const aligning = useRef(false);
+  /** Last time the playhead was seen moving while playing, for the stall watchdog. */
+  const progress = useRef({t: 0, at: 0});
 
-  const [connection, setConnection] = useState<SocketState>('idle');
-  const [canControl, setCanControl] = useState(false);
-  const [ownerName, setOwnerName] = useState('the host');
-  const [notice, setNotice] = useState<string | null>(null);
+  const [view, setView] = useState<RoomSessionState | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const [chat, setChat] = useState<ChatLine[]>([]);
   const [chatOpen, setChatOpen] = useState(false);
-  const [roster, setRoster] = useState<SfuPeer[]>([]);
   const [hud, setHud] = useState({expected: 0, actual: 0, drift: 0, playing: false});
   const [level, setLevel] = useState<LevelInfo | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -95,11 +86,11 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
 
   /**
    * Moves the player to where the room is right now.
-   *  - paused room: pin the exact position (a paused seek costs nothing);
-   *  - playing room, already close: just play (resuming from a buffered pause is near-instant);
-   *  - playing room, far off: seek AHEAD by the learned seek-ready time, hold paused until the
-   *    player has data, then start exactly when the room's timeline reaches that frame. Seeking
-   *    straight to the room position would land late by a variable 1–2.3 s rebuffer on VVD.
+   *  - paused room: pause and pin the exact position (a paused seek is cheap and refreshes the pipeline);
+   *  - playing room, already close and freshly seeked: just play (near-instant from a buffered pause);
+   *  - otherwise: seek AHEAD by the learned seek-ready time, hold paused until the player has data,
+   *    then start exactly when the room's timeline reaches that frame. Seeking straight to the room
+   *    position would land late by a variable 1–2.3 s rebuffer on VVD.
    */
   const applyNow = useCallback((reason: string, retried = false) => {
     const p = player.current;
@@ -110,6 +101,7 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     const expected = expectedPosition(s, now);
     const gap = expected - p.currentTime();
     p.setRate(1);
+    progress.current = {t: p.currentTime(), at: now};
 
     // The room can keep "playing" past the end (Inox has no ended state); show the last frame.
     const duration = p.duration();
@@ -130,13 +122,13 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       logger.info('sync', 'APPLIED', {reason, mode: 'pin', target: +expected.toFixed(3), localNowMs: now});
       return;
     }
-    // Resuming is near-instant only from a buffered position; otherwise hold like a seek.
+    // Already playing and close: carry on. A paused player is never started with a plain play()
+    // (R17), only through the hold below.
     const buffered = !p.isSeeking() && p.bufferedAhead() >= MIN_BUFFER_AHEAD_S;
-    if (Math.abs(gap) <= APPLY_SEEK_TOLERANCE_S && buffered) {
+    if (!p.isPaused() && Math.abs(gap) <= DRIFT_SEEK_THRESHOLD_S && buffered) {
       aligning.current = false;
-      p.play();
       settleUntil.current = now + START_SETTLE_MS;
-      logger.info('sync', 'APPLIED', {reason, mode: 'resume', gap: +gap.toFixed(3), localNowMs: now});
+      logger.info('sync', 'APPLIED', {reason, mode: 'continue', gap: +gap.toFixed(3), localNowMs: now});
       return;
     }
 
@@ -171,10 +163,11 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
         player.current?.play();
         aligning.current = false;
         settleUntil.current = Date.now() + START_SETTLE_MS;
+        progress.current = {t: player.current?.currentTime() ?? 0, at: Date.now()};
         logger.info('sync', 'HOLD_START', {at: +(player.current?.currentTime() ?? 0).toFixed(3), localNowMs: Date.now()});
       };
       if (wait > 0) setTimeout(begin, wait * 1000);
-      else if (wait > -1) begin(); // slightly late: the rate ladder closes the rest
+      else if (wait > -DRIFT_SEEK_THRESHOLD_S) begin(); // slightly late: within tolerance
       else if (!retried) {
         aligning.current = false;
         applyNow('hold-retry', true); // ready took far longer than the lead; ewma has adapted
@@ -191,71 +184,8 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     player.current.load(url);
   }, []);
 
-  const handleMessage = useCallback(
-    (msg: WSMessage) => {
-      const now = Date.now();
-      switch (msg.type) {
-        case 'SYNC_PLAYBACK': {
-          clockOffset.current = clockOffsetFromSync(msg, now);
-          const s = fromSync(msg, now, clockOffset.current);
-          if (!s) return;
-          state.current = s;
-          logger.info('sync', 'SYNC_PLAYBACK', {anchor: s.anchorTime, playing: s.isPlaying, kind: s.kind, clockOffsetMs: clockOffset.current});
-          if (s.kind === 'live') {
-            setNotice("Live channels aren't available on TV yet");
-            return;
-          }
-          setNotice(null);
-          ensureMedia(s.mediaUrl);
-          applyNow('SYNC_PLAYBACK');
-          return;
-        }
-        case 'PLAY':
-        case 'PAUSE':
-        case 'SEEK':
-        case 'CHANGE_MEDIA': {
-          if (!state.current || isOwnEcho(msg, session.user_id)) return;
-          state.current = applyRemote(state.current, msg, now, clockOffset.current);
-          logger.info('sync', `REMOTE ${msg.type}`, {from: msg.sender_name, payload: msg.payload, localNowMs: now});
-          if (msg.type === 'CHANGE_MEDIA') {
-            if (state.current.kind === 'live') {
-              setNotice("Live channels aren't available on TV yet");
-              return;
-            }
-            setNotice(null);
-            ensureMedia(state.current.mediaUrl);
-          }
-          applyNow(msg.type);
-          return;
-        }
-        case 'CHAT_MESSAGE':
-          if (isChatPayload(msg.payload)) {
-            const line = {id: `${msg.timestamp}-${msg.sender_id}`, name: msg.sender_name ?? '?', text: msg.payload.message};
-            setChat((c) => [...c.slice(-49), line]);
-          }
-          return;
-        case 'SFU_PEERS':
-          setRoster(((msg.payload as {peers?: SfuPeer[]})?.peers ?? []).slice());
-          return;
-        case 'LIVE_LEADER': {
-          const p = msg.payload as LiveLeaderPayload | undefined;
-          if (p?.leader_id === session.user_id) {
-            // The TV can't produce live positions; hand leadership back or the live room stalls.
-            socket.current?.send('LIVE_POSITION', declineLeadershipPayload());
-            logger.info('sync', 'declined live leadership');
-          }
-          return;
-        }
-        default:
-          return;
-      }
-    },
-    [applyNow, ensureMedia, session.user_id],
-  );
-
-  // Mount: player, membership, room details, chat history, socket.
+  // Mount: player, then the room session (join → details + history → socket).
   useEffect(() => {
-    let cancelled = false;
     const p = new VegaPlayer();
     player.current = p;
     loadedUrl.current = null; // a new player has nothing loaded, even if the ref survived a remount
@@ -265,64 +195,70 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       if (b) settleUntil.current = Date.now() + SETTLE_MS;
     });
 
+    const rs = createRoomSession(room.id, {userId: session.user_id, username: session.username}, {
+      api,
+      createSocket: (roomId) =>
+        new RoomSocket(roomId, {
+          wsBaseUrl: config.wsBaseUrl,
+          WebSocketImpl: WebSocket as unknown as WebSocketCtor,
+          getSessionId: () => auth.get()?.id ?? session.id,
+          checkSession: async () => {
+            try {
+              await api.me();
+              return true;
+            } catch (err) {
+              return (err as {status?: number}).status !== 401;
+            }
+          },
+          authMode: 'query',
+          logger,
+        }),
+      now: () => Date.now(),
+      logger,
+    });
+    roomSession.current = rs;
+
+    let wasOpen = false;
+    let lastConnection = rs.getState().connection;
+    rs.subscribe((st, event) => {
+      setView(st);
+      if (st.connection !== lastConnection) {
+        lastConnection = st.connection;
+        logger.info('socket', 'state', {state: st.connection});
+        // A reconnect usually follows a network outage, during which hls.js may have given up.
+        if (st.connection === 'open' && wasOpen) player.current?.recoverNetwork();
+        if (st.connection === 'open') wasOpen = true;
+      }
+      if (event.type !== 'playback' || !st.playback) return;
+      state.current = st.playback;
+      logger.info('sync', event.reason, {anchor: +st.playback.anchorTime.toFixed(3), playing: st.playback.isPlaying, kind: st.playback.kind, clockOffsetMs: st.clockOffsetMs});
+      if (st.playback.kind === 'live') return;
+      ensureMedia(st.playback.mediaUrl);
+      applyNow(event.reason);
+    });
+
     (async () => {
       await p.init();
       if (pendingSurface.current) p.attachSurface(pendingSurface.current);
-      try {
-        await api.joinRoom(room.id);
-        const [{member}, history] = await Promise.all([api.getRoom(room.id), api.getMessages(room.id)]);
-        if (cancelled) return;
-        canControlRef.current = member.permissions.can_control_playback;
-        setCanControl(member.permissions.can_control_playback);
-        logger.info('room', 'entered', {room: room.name, role: member.role, canControl: member.permissions.can_control_playback});
-        setChat(history.map((m) => ({id: m.id, name: m.username, text: m.message})).slice(-50));
-      } catch (err) {
-        logger.error('room', 'enter failed', {err: String(err)});
-        if (!cancelled) setNotice("Couldn't open this room");
-        return;
+      if (await rs.enter()) {
+        const m = rs.getState().member;
+        logger.info('room', 'entered', {room: room.name, role: m?.role, canControl: rs.getState().canControl});
       }
-      api.listRooms()
-        .then(() => setOwnerName(room.owner_id === session.user_id ? 'you' : 'the host'))
-        .catch(() => undefined);
-
-      const s = new RoomSocket(room.id, {
-        wsBaseUrl: config.wsBaseUrl,
-        WebSocketImpl: WebSocket as never,
-        getSessionId: () => auth.get()?.id ?? session.id,
-        checkSession: async () => {
-          try {
-            await api.me();
-            return true;
-          } catch (err) {
-            return (err as {status?: number}).status !== 401;
-          }
-        },
-        authMode: 'query',
-        logger,
-      });
-      socket.current = s;
-      let wasOpen = false;
-      s.onState((st) => {
-        setConnection(st);
-        logger.info('socket', 'state', {state: st});
-        // A reconnect usually follows a network outage, during which hls.js may have given up.
-        if (st === 'open' && wasOpen) player.current?.recoverNetwork();
-        if (st === 'open') wasOpen = true;
-      });
-      s.onMessage(handleMessage);
-      s.connect();
     })();
 
     return () => {
-      cancelled = true;
-      socket.current?.close();
-      socket.current = null;
+      rs.leave();
+      roomSession.current = null;
       void p.destroy();
       player.current = null;
     };
-  }, [applyNow, handleMessage, room.id, room.name, room.owner_id, session.id, session.user_id]);
+  }, [applyNow, ensureMedia, room.id, room.name, session.id, session.user_id, session.username]);
 
-  // Drift loop: measure every second, seek when off by more than the threshold.
+  /**
+   * Drift loop, every second: R17 watchdog first, then seek-only correction through a hold.
+   * No playbackRate ladder: on VVD, setting playbackRate on a stalled pipeline blocked the JS thread
+   * for 5–13 s (sync run r17-c), and rate changes preceded the worst resumes in the player lab.
+   */
   useEffect(() => {
     const t = setInterval(() => {
       const p = player.current;
@@ -334,23 +270,38 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       if (aligning.current) return;
       // Past the end (Inox has no ended state): applyNow already parked the player on the last frame.
       if (p.duration() > 0 && expected >= p.duration() - 0.5) return;
-      const settling = now < settleUntil.current;
       const drift = expected - actual;
       setHud({expected, actual, drift, playing: s.isPlaying});
-      logger.info('sync', 'POS', {expected: +expected.toFixed(3), actual: +actual.toFixed(3), drift: +drift.toFixed(3), rate: p.rate(), playing: s.isPlaying, localNowMs: now});
-      if (settling) return;
+      logger.info('sync', 'POS', {expected: +expected.toFixed(3), actual: +actual.toFixed(3), drift: +drift.toFixed(3), playing: s.isPlaying, localNowMs: now});
+      // R17 watchdog, ahead of the settle window: a race shows on the first tick after a start, and
+      // the player's own 'waiting' events would otherwise keep extending the settle window.
+      if (s.isPlaying && !p.isPaused() && !p.isSeeking()) {
+        const moved = actual - progress.current.t;
+        const wallS = (now - progress.current.at) / 1000;
+        const frozen = Math.abs(moved) < 0.1 && wallS * 1000 > STALL_MS && p.bufferedAhead() >= 1;
+        const racing = moved > wallS * 1.2 + RACE_EXCESS_S;
+        if (frozen || racing) {
+          logger.warn('sync', frozen ? 'STALL' : 'RACE', {at: +actual.toFixed(3), moved: +moved.toFixed(3), wallS: +wallS.toFixed(3)});
+          progress.current = {t: actual, at: now};
+          settleUntil.current = now + SETTLE_MS;
+          void p.reset(); // onReady → applyNow('player-ready') re-aligns through a hold
+          return;
+        }
+        if (Math.abs(moved) >= 0.1) progress.current = {t: actual, at: now};
+      }
+      const settling = now < settleUntil.current;
       if (!s.isPlaying) {
-        if (Math.abs(drift) > PAUSED_PIN_TOLERANCE_S || !p.isPaused()) applyNow('pin-drift');
+        if (!settling && (Math.abs(drift) > PAUSED_REPIN_S || !p.isPaused())) applyNow('pin-drift');
         return;
       }
-      const action = driftAction(drift);
-      if (action.seek) {
+      if (p.isPaused()) {
+        if (!settling) applyNow('resume-stalled');
+        return;
+      }
+      if (correction(expected, actual, settling).seek) {
         logger.info('sync', 'DRIFT_SEEK', {drift: +drift.toFixed(3)});
         applyNow('drift');
-        return;
       }
-      p.setRate(action.rate);
-      if (p.isPaused()) applyNow('resume-stalled');
     }, DRIFT_CHECK_MS);
     return () => clearInterval(t);
   }, [applyNow]);
@@ -370,23 +321,20 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
 
   const sendPlayback = useCallback(
     (type: 'PLAY' | 'PAUSE' | 'SEEK', position: number) => {
-      const s = state.current;
-      if (!s) return;
-      if (!canControlRef.current) {
+      const rs = roomSession.current;
+      if (!rs) return;
+      const result = rs.sendPlayback(type, position);
+      if (result === 'forbidden') {
         logger.info('room', 'control blocked (no permission)', {type});
         showToast('Only the host can control playback');
-        return;
-      }
-      const playing = type === 'PLAY' ? true : type === 'PAUSE' ? false : s.isPlaying;
-      if (!socket.current?.send(type, {media_time_seconds: position})) {
+      } else if (result === 'offline') {
         showToast('Not connected — try again in a moment');
-        return;
+      } else if (result === 'sent') {
+        logger.info('room', `sent ${type}`, {position});
       }
-      state.current = applyLocal(s, playing, position, Date.now());
-      logger.info('room', `sent ${type}`, {position});
-      applyNow(`local ${type}`);
+      // 'sent' re-anchors the session, whose playback event runs applyNow.
     },
-    [applyNow, showToast],
+    [showToast],
   );
 
   useTVEventHandler((evt: HWEvent) => {
@@ -425,7 +373,12 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     }
   });
 
-  const controlLine = canControl ? 'You control playback' : `Following ${ownerName}`;
+  const connection = view?.connection ?? 'idle';
+  const chat = view?.chat ?? [];
+  const roster = view?.roster ?? [];
+  const notice = view?.notice ? (view.notice.kind === 'live-unsupported' ? LIVE_NOTICE : view.notice.message) : null;
+  const ownerName = room.owner_id === session.user_id ? 'you' : 'the host';
+  const controlLine = view?.canControl ? 'You control playback' : `Following ${ownerName}`;
 
   return (
     <View style={styles.root}>
@@ -460,10 +413,10 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       {chatOpen ? (
         <View style={styles.chat}>
           <Text style={styles.chatTitle}>Chat</Text>
-          {chat.slice(-12).map((l) => (
-            <Text key={l.id} style={styles.chatLine}>
-              <Text style={styles.chatName}>{l.name}: </Text>
-              {l.text}
+          {chat.slice(-12).map((m) => (
+            <Text key={m.id} style={styles.chatLine}>
+              <Text style={styles.chatName}>{m.username}: </Text>
+              {m.message}
             </Text>
           ))}
           {chat.length === 0 ? <Text style={styles.chatLine}>No messages yet</Text> : null}

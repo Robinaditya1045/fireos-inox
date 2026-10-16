@@ -7,4 +7,6 @@ export const config = {
   wsBaseUrl: generatedConfig.wsBaseUrl,
   devEmail: __DEV__ ? generatedConfig.devEmail : '',
   devPassword: __DEV__ ? generatedConfig.devPassword : '',
+  /** Dev-only player test bench (src/dev/PlayerLab.tsx) instead of the app, for R17. */
+  playerLab: __DEV__ ? generatedConfig.playerLab : null,
 };
