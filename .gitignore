@@ -1,0 +1,49 @@
+# Planning and development docs stay local (owner decision D3, 2026-10-16).
+# Reviewer-facing material (README.md, AWS_BUILDER.md, LICENSE, kiro-crew/) lives outside /docs.
+/docs
+
+# Local Inox stack: snapshot, binaries, rendered env, seed credentials, media storage
+.devstack/
+
+# Environment files (never put a .env at the repo root: Inox's config loader reads parent dirs)
+.env
+.env.*
+!.env.example
+
+# Generated app config (contains local host/IP and, in dev, prefilled credentials)
+apps/*/src/platform/config.generated.ts
+
+# Dependencies
+node_modules/
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.pnp.*
+
+# Build output
+dist/
+build/
+coverage/
+*.tsbuildinfo
+*.vpkg
+
+# Media and HLS fixtures (generated locally from openly licensed sources)
+tools/mock-inox/fixtures/hls/
+*.mp4
+*.mov
+# (HLS .ts segments are covered by the fixtures folder; never ignore *.ts globally — that is TypeScript)
+
+# Logs and OS/editor noise
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+.idea/
+
+# Signing material (phase 2 Android, never commit)
+*.keystore
+*.jks
