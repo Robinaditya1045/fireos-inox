@@ -32,19 +32,19 @@ FireOS-Inox is a Fire TV client, targeting **Vega OS** with **React Native for V
 These span several docs (`architecture.md`, `inox-contract.md`, `testing.md`) and are easy to get wrong:
 - **Protocol types mirror Inox exactly** (snake_case, file header naming the Inox source file and commit). Inbound WS payloads go through runtime guards; malformed frames are dropped and logged, never thrown.
 - **Room entry order:** `POST /rooms/{id}/join` → `GET /rooms/{id}` + `GET /messages` in parallel → WS connect → wait for `SYNC_PLAYBACK`. Skipping the join makes the WS handshake fail. Leaving the screen closes the socket but does not leave the room membership.
-- **Sync uses an anchor model** ("position X at local time T", extrapolated), not a stored `currentTime`. PLAY latency compensation applies only when it is 0–5 s, matching the web client. Drift check every 1 s: seek if `|drift| > 1.0 s`, ignore for 2 s after a seek/buffering. No rate nudging.
+- **Sync uses an anchor model** ("position X at local time T", extrapolated), not a stored `currentTime`, plus a device−server clock offset taken from each `SYNC_PLAYBACK.timestamp`. PLAY latency compensation applies only when it is 0–5 s, matching the web client. Corrections: rate ladder (±0.05/±0.15) up to 1.5 s, beyond that seek-ahead-and-hold gated on `video.buffered`; never seek while paused unless more than 1.5 s off (see `docs/dev/architecture.md` §3.4.1 — this supersedes the original seek-only policy).
 - **Echo suppression:** drop own `PLAY`/`PAUSE`/`SEEK`/`CHANGE_MEDIA` (by `sender_id`), but render own `CHAT_MESSAGE` from the echo. Local actions apply optimistically.
 - **Only explicit key handlers send playback events**; player callbacks never send. The server does not enforce `can_control_playback`, so the client must (show a toast instead).
 - **Live media is out of scope:** show a notice and decline leadership by sending `LIVE_POSITION {unable:true}` when `LIVE_LEADER` names the TV user, or the live room stalls.
 - **RoomSocket reconnects forever** while the room screen is mounted (1 s → 15 s backoff, ±20 % jitter, reset after 10 s open), checking `api.me()` first so a 401 routes to Sign-in.
 
 ## Status (2026-10-16, end of validation session)
-M0 spike done on VVD (Vega SDK 0.24.12112, CLI 1.4.4, RN 0.83 template, Zorin host works). Git repo initialised; only the first commit exists — the spike code is **uncommitted**. Repo stays **private** for now (decision D12). Validation results:
+M0 spike done on VVD (Vega SDK 0.24.12112, CLI 1.4.4, RN 0.83 template, Zorin host works). Spike committed as `ba1d143`. Repo stays **private** for now (decision D12). Validation results:
 - ✅ VVD boots, app runs · ✅ login + authenticated WS open 334 s with no reconnect · ✅ hls.js plays the Inox 1080/720/480 ladder and switches renditions · ✅ network loss → reconnect (backoff) → resync (0.03 s drift 6.4 s after restore) · ✅ chat panel, member-control toast.
 - ⚠️ Browser PLAY/PAUSE/SEEK reach the TV in ~50 ms; TV median drift vs room ~0.04 s, but VVD's player sometimes jumps ~5 s ahead on play/after seeks (friction F6) → 3–7 s excursions before correction. Partial.
-- ⏳ D-pad-only walk-through started (screens in `.devstack/evidence/2x-*`), not finished/reviewed.
+- ✅ Remote-only walk-through (`tools/validate/dpad-walk.sh`, evidence `dpad-walk.txt`); on-screen keyboard text entry untested (no keyboard appears in VVD).
 - ⛔ Kiro Crew 0.8.0 installed; needs owner to install `kiro-cli` and run `kiro-cli login` before any task can run.
-Evidence: `.devstack/evidence/` (screenshots, `sync-run-*.txt`, `netkill-2.txt`). Friction log F1–F7 in `docs/dev/friction-log.md`. Docs (contract, local-stack, roadmap, risks, session-log) still need updating with these findings.
+Evidence: `.devstack/evidence/` (screenshots, `sync-run-*.txt`, `netkill-2.txt`). Friction log F1–F7 in `docs/dev/friction-log.md`. Docs are updated with these findings (contract §6, local-stack, vega-simulator, architecture §3.4.1, roadmap M0, risks R16–R18, session-log).
 
 ## Verified gotchas (Vega / Inox)
 - Vega `clearTimeout` throws on invalid handles → shimmed in `VegaPlayer.ts` (hls.js dies without it).
