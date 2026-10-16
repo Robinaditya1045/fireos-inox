@@ -1,0 +1,63 @@
+schema-version = 1
+
+[package]
+title = "FireOS-Inox"
+version = "0.1.0"
+id = "com.fireosinox.tv"
+
+[os.version]
+min = "1.2"
+target = "1.2"
+
+[needs]
+[[needs.module]]
+id = "/com.amazon.vega.os@IVega_1_2"
+
+[[needs.module]]
+id = "/com.amazon.kepler.keplerscript_4@IKeplerScript_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.kepler_media_controls_1@IKeplerMediaControls_0"
+
+[[needs.module]]
+id = "/com.amazon.kepler.keplermediadescriptor_1@IKeplermediadescriptor_1"
+
+[[needs.module]]
+id = "/com.amazon.kepler.w3cmedia_2@IW3cmedia_3"
+
+
+
+
+
+[components]
+[[components.interactive]]
+id = "com.fireosinox.tv.main"
+runtime-module = "/com.amazon.kepler.runtime.react_native_kepler_4@IReactNativeKepler_0"
+launch-type = "singleton"
+categories = ["com.amazon.category.main"]
+
+# W3C media player services (Vega docs: media-player-setup, SDK 0.24).
+[wants]
+[[wants.service]]
+id = "com.amazon.mediametrics.service"
+
+[[wants.privilege]]
+id = "com.amazon.devconf.privilege.accessibility"
+
+[[wants.service]]
+id = "com.amazon.mediabuffer.service"
+
+[[wants.service]]
+id = "com.amazon.mediatransform.service"
+
+[[wants.service]]
+id = "com.amazon.audio.stream"
+
+[[wants.service]]
+id = "com.amazon.audio.control"
+
+[[wants.service]]
+id = "com.amazon.media.server"
+
+[[wants.service]]
+id = "com.amazon.media.playersession.service"

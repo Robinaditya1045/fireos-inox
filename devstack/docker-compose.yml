@@ -1,0 +1,37 @@
+# Isolated infrastructure for the local Inox backend (decision D6).
+# Non-default host ports and no container_name, so it runs beside Inox's own `make up`.
+# MinIO is intentionally absent: Inox falls back to local-disk storage when it is unreachable.
+name: fireos-inox-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: inox
+    ports:
+      - "15432:5432"
+    volumes:
+      - pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d inox"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "16379:6379"
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pg: {}
+  redis: {}

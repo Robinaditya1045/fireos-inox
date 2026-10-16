@@ -47,3 +47,6 @@ yarn-error.log*
 # Signing material (phase 2 Android, never commit)
 *.keystore
 *.jks
+
+# Amazon's patched hls.js build is a source input for the app, not build output (see risk R16).
+!apps/vega/src/hlsjsplayer/dist/

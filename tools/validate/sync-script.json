@@ -1,0 +1,10 @@
+[
+  {"at": 3000, "do": "play"},
+  {"at": 25000, "do": "screenshot", "name": "10-web-playing"},
+  {"at": 30000, "do": "seek", "t": 60},
+  {"at": 50000, "do": "pause"},
+  {"at": 60000, "do": "play"},
+  {"at": 80000, "do": "seek", "t": 20},
+  {"at": 100000, "do": "pause"},
+  {"at": 108000, "do": "screenshot", "name": "11-web-paused"}
+]

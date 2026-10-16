@@ -38,11 +38,32 @@ These span several docs (`architecture.md`, `inox-contract.md`, `testing.md`) an
 - **Live media is out of scope:** show a notice and decline leadership by sending `LIVE_POSITION {unable:true}` when `LIVE_LEADER` names the TV user, or the live room stalls.
 - **RoomSocket reconnects forever** while the room screen is mounted (1 s → 15 s backoff, ±20 % jitter, reset after 10 s open), checking `api.me()` first so a 401 routes to Sign-in.
 
+## Status (2026-10-16, end of validation session)
+M0 spike done on VVD (Vega SDK 0.24.12112, CLI 1.4.4, RN 0.83 template, Zorin host works). Git repo initialised; only the first commit exists — the spike code is **uncommitted**. Repo stays **private** for now (decision D12). Validation results:
+- ✅ VVD boots, app runs · ✅ login + authenticated WS open 334 s with no reconnect · ✅ hls.js plays the Inox 1080/720/480 ladder and switches renditions · ✅ network loss → reconnect (backoff) → resync (0.03 s drift 6.4 s after restore) · ✅ chat panel, member-control toast.
+- ⚠️ Browser PLAY/PAUSE/SEEK reach the TV in ~50 ms; TV median drift vs room ~0.04 s, but VVD's player sometimes jumps ~5 s ahead on play/after seeks (friction F6) → 3–7 s excursions before correction. Partial.
+- ⏳ D-pad-only walk-through started (screens in `.devstack/evidence/2x-*`), not finished/reviewed.
+- ⛔ Kiro Crew 0.8.0 installed; needs owner to install `kiro-cli` and run `kiro-cli login` before any task can run.
+Evidence: `.devstack/evidence/` (screenshots, `sync-run-*.txt`, `netkill-2.txt`). Friction log F1–F7 in `docs/dev/friction-log.md`. Docs (contract, local-stack, roadmap, risks, session-log) still need updating with these findings.
+
+## Verified gotchas (Vega / Inox)
+- Vega `clearTimeout` throws on invalid handles → shimmed in `VegaPlayer.ts` (hls.js dies without it).
+- RN WebSocket sends `Origin: http://localhost:18080` → allowlisted in `devstack/env.template`.
+- Inox returns `null` (not `[]`) for empty lists → normalised in `packages/core/src/api.ts`.
+- VVD clock is ~0.9 s behind host → sync uses the offset from `SYNC_PLAYBACK.timestamp`.
+- `KEY_PLAYPAUSE` arrives as eventType `play`. JS logs only via `tools/devlog/devlog.mjs` (Metro inspector).
+- 5.1 AAC doesn't decode on VVD; seed stereo content. Don't seek while paused (resume jumps).
+- `pkill -f`/`pgrep -f` with a pattern that appears in your own command line kills your shell — anchor patterns (`^…`).
+
 ## Commands
-Fill these in as they are created and confirmed. Don't list commands that haven't been run. Nothing has been built yet (pre-M0; not yet a git repo).
-- Local stack: see `docs/dev/local-stack.md` (`scripts/stack-up.sh`, `scripts/run-backend.sh`, …). Shell scripts load env with `set -a; source .devstack/env; set +a` and run Inox binaries with cwd `.devstack/run`.
-- Vega/VVD: see `docs/dev/vega-simulator.md`.
-- Core tests: _tbd (M1)_. Vitest on `packages/core` is proposed (D11); package manager/workspace layout is decision D9.
+Confirmed working on 2026-10-16:
+- Stack: `scripts/inox-snapshot.sh && scripts/inox-build.sh && scripts/render-env.sh && scripts/stack-up.sh`, then `scripts/run-backend.sh` / `scripts/run-worker.sh` (background with `setsid nohup … &`), `node scripts/seed.mjs`.
+- VVD: `source ~/vega/env; vega virtual-device start --timeout 240`; wait for `vda devices` to show `device`; `scripts/vvd-forward.sh` (and `vega device start-port-forwarding --port 8081 --forward false` for Metro).
+- App: `node scripts/write-app-config.mjs`; `cd apps/vega && npm run build:debug && vega run-app build/x86_64-debug/fireosinox_x86_64.vpkg`; dev loop: `npx react-native start --port 8081` + `node tools/devlog/devlog.mjs > .devstack/logs/app-all.log`.
+- Typecheck: `cd apps/vega && npx tsc --noEmit -p tsconfig.json`.
+- Drive/inspect VVD: `scripts/vvd.sh key KEY_DOWN …`, `scripts/vvd.sh shot <name>`.
+- Validation: web client from snapshot on :15173 (see local-stack.md §8), `node tools/validate/browser-host.mjs tools/validate/sync-script.json`, `node tools/validate/analyze-sync.mjs <web.log> .devstack/logs/app-all.log`, `tools/validate/netkill.sh`, `node tools/sync-probe/probe.mjs send|listen|script`.
+- Core tests: none yet (M1; Vitest proposed, D11). Layout decided: standalone npm app + Metro `watchFolders` (D9).
 
 ## Working agreement
 - Milestones run in order (`docs/dev/roadmap.md`). M0 is a go/no-go gate.

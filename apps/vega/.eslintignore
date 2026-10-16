@@ -1,0 +1,4 @@
+# Vendored from Amazon's hls.js patch (hls-rel v1.5.11-r1.7); kept exactly as shipped.
+src/hlsjsplayer/
+src/PlayerBase.ts
+src/PlayerInterface.ts

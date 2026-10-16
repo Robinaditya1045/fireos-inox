@@ -1,0 +1,9 @@
+{
+  "name": "@fireos-inox/validate",
+  "private": true,
+  "type": "module",
+  "description": "Validation harness: drives the real Inox web client in headless Chrome as the room host.",
+  "dependencies": {
+    "puppeteer-core": "23.11.1"
+  }
+}
