@@ -1,6 +1,7 @@
 // PlayerAdapter for Vega: W3C VideoPlayer + Amazon's patched hls.js (MSE mode), wired the way
-// Amazon's hls.js sample (hls-rel v1.5.11-r1.7) does it. The video surface handle arrives later,
-// from KeplerVideoSurfaceView, via attachSurface().
+// Amazon's hls.js sample (hls-rel v1.5.11-r1.7) does it, for HLS; single files (MP4, MKV, …) use the
+// player's URL mode (`src`, react-native-w3cmedia README "URL Mode playback"). The video surface
+// handle arrives later, from KeplerVideoSurfaceView, via attachSurface().
 // @ts-nocheck — the vendored hls.js bundle and w3cmedia polyfills ship without usable types.
 import {VideoPlayer} from '@amazon-devices/react-native-w3cmedia';
 import {HlsJsPlayer} from '../hlsjsplayer/HlsJsPlayer';
@@ -10,6 +11,7 @@ import Element from '../hlsjsplayer/polyfills/ElementPolyfill';
 import TextDecoderPolyfill from '../hlsjsplayer/polyfills/TextDecoderPolyfill';
 import W3CMediaPolyfill from '../hlsjsplayer/polyfills/W3CMediaPolyfill';
 import MiscPolyfill from '../hlsjsplayer/polyfills/MiscPolyfill';
+import {isHlsUrl} from '../../../../packages/core/src';
 import {logger} from '../platform/logger';
 
 let polyfillsInstalled = false;
@@ -48,6 +50,12 @@ function installPolyfills() {
   polyfillsInstalled = true;
 }
 
+function timeRanges(r: {length: number; start(i: number): number; end(i: number): number} | undefined): number[][] {
+  const out: number[][] = [];
+  for (let i = 0; i < (r?.length ?? 0); i++) out.push([r.start(i), r.end(i)]);
+  return out;
+}
+
 export interface LevelInfo {
   index: number;
   height: number;
@@ -58,6 +66,11 @@ export interface LevelInfo {
 // web client restarts it with backoff (WatchPartyPlayer.tsx RETRY_BASE_MS/RETRY_MAX_MS); so do we.
 const RETRY_BASE_MS = 2_000;
 const RETRY_MAX_MS = 30_000;
+/**
+ * In URL mode `buffered` stays empty on VVD (readyState still reaches HAVE_FUTURE_DATA), so
+ * bufferedAhead() reports this much once the player says it can play on.
+ */
+const FILE_READY_AHEAD_S = 10;
 
 export class VegaPlayer {
   private video: VideoPlayer | null = null;
@@ -67,6 +80,8 @@ export class VegaPlayer {
   /** The hls.js instance our listeners are on; HlsJsPlayer reuses one instance across loads. */
   private listening: unknown = null;
   private url: string | null = null;
+  /** How the current URL plays: hls.js over MSE, or the player's URL mode for a single file. */
+  private mode: 'hls' | 'file' = 'hls';
   private surface: string | null = null;
   private resetting = false;
   private hlsConfig: Record<string, unknown> = {};
@@ -74,6 +89,7 @@ export class VegaPlayer {
   private readyListeners: Array<() => void> = [];
   private levelListeners: Array<(l: LevelInfo) => void> = [];
   private bufferingListeners: Array<(buffering: boolean) => void> = [];
+  private errorListeners: Array<(code: number | undefined) => void> = [];
 
   async init(): Promise<void> {
     this.video = new VideoPlayer();
@@ -83,14 +99,22 @@ export class VegaPlayer {
     installPolyfills();
     this.video.addEventListener('loadedmetadata', () => {
       this.ready = true;
-      logger.info('player', 'loadedmetadata', {duration: this.video?.duration});
+      logger.info('player', 'loadedmetadata', {duration: this.video?.duration, seekable: timeRanges(this.video?.seekable)});
       this.readyListeners.forEach((cb) => cb());
     });
-    this.video.addEventListener('waiting', () => this.bufferingListeners.forEach((cb) => cb(true)));
-    this.video.addEventListener('playing', () => this.bufferingListeners.forEach((cb) => cb(false)));
-    this.video.addEventListener('error', () =>
-      logger.error('player', 'media element error', {code: this.video?.error?.code, message: this.video?.error?.message}),
-    );
+    this.video.addEventListener('waiting', () => {
+      logger.debug('player', 'waiting', {at: this.video?.currentTime, readyState: this.video?.readyState});
+      this.bufferingListeners.forEach((cb) => cb(true));
+    });
+    this.video.addEventListener('playing', () => {
+      logger.debug('player', 'playing', {at: this.video?.currentTime});
+      this.bufferingListeners.forEach((cb) => cb(false));
+    });
+    this.video.addEventListener('error', () => {
+      const code = this.video?.error?.code;
+      logger.error('player', 'media element error', {code, message: this.video?.error?.message});
+      this.errorListeners.forEach((cb) => cb(code));
+    });
   }
 
   /** `hlsConfig` overrides the sample's hls.js settings (read live by hls.js; used by the player lab). */
@@ -99,6 +123,15 @@ export class VegaPlayer {
     this.ready = false;
     this.url = url;
     this.hlsConfig = hlsConfig;
+    this.mode = isHlsUrl(url) ? 'hls' : 'file';
+    if (this.mode === 'file') {
+      // URL mode: the player fetches and demuxes the file itself. Only the first load lands here
+      // with a fresh element; later loads come through switchTo()/reset(), which drop hls.js first.
+      // The src setter loads by itself (MediaPlayer.setSrcWithCustomHeaders), so no load() here.
+      this.video.src = url;
+      logger.info('player', 'load', {url, mode: 'file'});
+      return;
+    }
     if (this.hls) {
       void this.hls.unload();
     } else {
@@ -146,11 +179,15 @@ export class VegaPlayer {
     }, delay);
   }
 
-  /** Restarts hls.js loading now (e.g. when the room socket has just reconnected). */
+  /** Restarts loading now (e.g. when the room socket has just reconnected). */
   recoverNetwork(): void {
     const hls = this.hls?.player;
-    if (!hls) return;
-    hls.startLoad(this.video?.currentTime ?? -1);
+    if (hls) {
+      hls.startLoad(this.video?.currentTime ?? -1);
+    } else if (this.url && this.video?.error) {
+      // A file that failed to load has no loader to restart; a rebuild fetches it again.
+      void this.reset();
+    }
   }
 
   attachSurface(handle: string): void {
@@ -164,6 +201,21 @@ export class VegaPlayer {
   }
 
   /**
+   * Switches to another stream (CHANGE_MEDIA). On VVD, loading a second stream into the element that
+   * played the first never reached loadedmetadata (media library switch, 2026-10-17; player lab 0/2
+   * for a reload into the same element), so a switch rebuilds the element through reset().
+   */
+  switchTo(url: string): Promise<void> {
+    if (!this.url) {
+      this.load(url, this.hlsConfig);
+      return Promise.resolve();
+    }
+    this.url = url;
+    this.ready = false;
+    return this.reset();
+  }
+
+  /**
    * Rebuilds the media element and hls.js from scratch and reloads the current stream; onReady
    * listeners fire again once it is back. On VVD a player that raced or wedged after a resume (R17)
    * came back 2/2 this way, against 0/2 for reloading into the same element and 1/2 for
@@ -172,8 +224,7 @@ export class VegaPlayer {
   async reset(): Promise<void> {
     if (this.resetting) return;
     this.resetting = true;
-    const url = this.url;
-    logger.warn('player', 'resetting media element', {url});
+    logger.warn('player', 'resetting media element', {url: this.url});
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
     try {
@@ -189,7 +240,8 @@ export class VegaPlayer {
     try {
       await this.init();
       if (this.surface) this.video?.setSurfaceHandle(this.surface);
-      if (url) this.load(url, this.hlsConfig);
+      // The current URL, not the one at the start: a switchTo() during the rebuild must win.
+      if (this.url) this.load(this.url, this.hlsConfig);
     } finally {
       this.resetting = false;
     }
@@ -211,12 +263,22 @@ export class VegaPlayer {
     this.bufferingListeners.push(cb);
   }
 
+  /** The media element failed (MediaError code: 2 network, 3 decode, 4 unsupported source). */
+  onError(cb: (code: number | undefined) => void): void {
+    this.errorListeners.push(cb);
+  }
+
   play(): void {
     void this.video?.play();
   }
 
   pause(): void {
     this.video?.pause();
+  }
+
+  /** True when the current URL plays as a single file (URL mode) rather than through hls.js. */
+  playsFile(): boolean {
+    return this.mode === 'file';
   }
 
   isPaused(): boolean {
@@ -235,11 +297,15 @@ export class VegaPlayer {
   /**
    * Seconds of media buffered contiguously ahead of the playhead. On Vega, readyState can report
    * HAVE_FUTURE_DATA right after a seek while the playhead's range is not buffered yet; play() then
-   * makes hls.js gap-jump seconds ahead (seen on VVD). The buffered ranges are the reliable signal.
+   * makes hls.js gap-jump seconds ahead (seen on VVD). The buffered ranges are the reliable signal,
+   * except in URL mode, which reports none.
    */
   bufferedAhead(): number {
     const v = this.video;
     if (!v?.buffered) return 0;
+    if (this.mode === 'file' && v.buffered.length === 0) {
+      return !v.seeking && v.readyState >= 3 ? FILE_READY_AHEAD_S : 0;
+    }
     const t = v.currentTime;
     for (let i = 0; i < v.buffered.length; i++) {
       const start = v.buffered.start(i);

@@ -7,6 +7,7 @@ import {
   createRoomSession,
   DRIFT_SEEK_THRESHOLD_S,
   expectedPosition,
+  isTvPlayableScheme,
   RoomSocket,
   SETTLE_MS,
   type PlaybackState,
@@ -16,6 +17,7 @@ import {
   type Session,
   type WebSocketCtor,
 } from '../../../../packages/core/src';
+import {LibraryPanel} from '../components/LibraryPanel';
 import {config} from '../platform/config';
 import {logger} from '../platform/logger';
 import {api, auth} from '../platform/services';
@@ -55,6 +57,22 @@ const STALL_MS = 2000;
 const RACE_EXCESS_S = 1.0;
 
 const LIVE_NOTICE = "Live channels aren't available on TV yet";
+/**
+ * F10: on VVD, URL-mode MKV playback ignores every seek (the playhead carries on from where it was)
+ * while `seekable` still claims the whole file, so it is detected from playback: a hold whose
+ * playhead continued from its old place instead of the seek target is a miss.
+ */
+const SEEK_MISS_S = 2;
+const SEEK_MISSES_UNSEEKABLE = 2;
+/** URLs found unseekable this app session; a re-entered room skips the detection. */
+const unseekableUrls = new Set<string>();
+const UNSEEKABLE_NOTICE = "This video can't skip on TV, so it may be out of step with the room";
+/** MediaError codes (HTMLMediaElement): 2 network, 3 decode, 4 source not supported. */
+const MEDIA_ERRORS: Record<number, string> = {
+  2: "Couldn't download this video",
+  3: "This video's format isn't supported on TV",
+  4: "This video's format isn't supported on TV",
+};
 
 export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Session; onLeave: () => void}) => {
   const player = useRef<VegaPlayer | null>(null);
@@ -70,10 +88,18 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
   const aligning = useRef(false);
   /** Last time the playhead was seen moving while playing, for the stall watchdog. */
   const progress = useRef({t: 0, at: 0});
+  /** The last hold-start on a file: where the playhead was before the seek and where it should be. */
+  const seekCheck = useRef<{from: number; target: number; at: number} | null>(null);
+  const seekMisses = useRef(0);
+  const [mediaNotice, setMediaNotice] = useState<string | null>(null);
 
   const [view, setView] = useState<RoomSessionState | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  /** Read by the key handler: while the library is open, keys move focus in it and nothing else. */
+  const libraryOpenRef = useRef(false);
+  libraryOpenRef.current = libraryOpen;
   const [hud, setHud] = useState({expected: 0, actual: 0, drift: 0, playing: false});
   const [level, setLevel] = useState<LevelInfo | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -102,6 +128,20 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     const gap = expected - p.currentTime();
     p.setRate(1);
     progress.current = {t: p.currentTime(), at: now};
+
+    // A file that can't seek (F10) can only follow play and pause; a seek or rebuild would not help.
+    if (loadedUrl.current && unseekableUrls.has(loadedUrl.current)) {
+      aligning.current = false;
+      const ended = p.duration() > 0 && expected >= p.duration() - 0.5;
+      if (s.isPlaying && !ended) {
+        if (p.isPaused()) p.play();
+      } else {
+        p.pause();
+      }
+      settleUntil.current = now + START_SETTLE_MS;
+      logger.info('sync', 'APPLIED', {reason, mode: 'unseekable', gap: +gap.toFixed(3), localNowMs: now});
+      return;
+    }
 
     // The room can keep "playing" past the end (Inox has no ended state); show the last frame.
     const duration = p.duration();
@@ -135,6 +175,7 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     aligning.current = true;
     const lead = Math.min(6, Math.max(1, seekReady.ewma * 1.3 + 0.3));
     const target = expected + lead;
+    const from = p.currentTime();
     p.pause();
     p.seek(target);
     logger.info('sync', 'APPLIED', {reason, mode: 'hold', target: +target.toFixed(3), lead: +lead.toFixed(3), localNowMs: now});
@@ -164,6 +205,7 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
         aligning.current = false;
         settleUntil.current = Date.now() + START_SETTLE_MS;
         progress.current = {t: player.current?.currentTime() ?? 0, at: Date.now()};
+        if (player.current?.playsFile() && Math.abs(target - from) > SEEK_MISS_S) seekCheck.current = {from, target, at: Date.now()};
         logger.info('sync', 'HOLD_START', {at: +(player.current?.currentTime() ?? 0).toFixed(3), localNowMs: Date.now()});
       };
       if (wait > 0) setTimeout(begin, wait * 1000);
@@ -181,7 +223,10 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
   const ensureMedia = useCallback((url: string) => {
     if (!player.current || !url || loadedUrl.current === url) return;
     loadedUrl.current = url;
-    player.current.load(url);
+    seekCheck.current = null;
+    seekMisses.current = 0;
+    setMediaNotice(unseekableUrls.has(url) ? UNSEEKABLE_NOTICE : null);
+    void player.current.switchTo(url);
   }, []);
 
   // Mount: player, then the room session (join → details + history → socket).
@@ -193,6 +238,12 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     p.onLevel(setLevel);
     p.onBuffering((b) => {
       if (b) settleUntil.current = Date.now() + SETTLE_MS;
+    });
+    p.onError((code) => {
+      const url = state.current?.mediaUrl ?? '';
+      // Someone else may have picked an http:// file, which Vega's player refuses (D16).
+      if (url && !isTvPlayableScheme(url)) showToast('The TV plays video files only from https:// links');
+      else showToast(MEDIA_ERRORS[code ?? 0] ?? "Couldn't play this video");
     });
 
     const rs = createRoomSession(room.id, {userId: session.user_id, username: session.username}, {
@@ -252,7 +303,7 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       void p.destroy();
       player.current = null;
     };
-  }, [applyNow, ensureMedia, room.id, room.name, session.id, session.user_id, session.username]);
+  }, [applyNow, ensureMedia, showToast, room.id, room.name, session.id, session.user_id, session.username]);
 
   /**
    * Drift loop, every second: R17 watchdog first, then seek-only correction through a hold.
@@ -272,7 +323,30 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       if (p.duration() > 0 && expected >= p.duration() - 0.5) return;
       const drift = expected - actual;
       setHud({expected, actual, drift, playing: s.isPlaying});
-      logger.info('sync', 'POS', {expected: +expected.toFixed(3), actual: +actual.toFixed(3), drift: +drift.toFixed(3), playing: s.isPlaying, localNowMs: now});
+      logger.info('sync', 'POS', {expected: +expected.toFixed(3), actual: +actual.toFixed(3), drift: +drift.toFixed(3), playing: s.isPlaying, buffered: +p.bufferedAhead().toFixed(1), readyState: p.readyState(), localNowMs: now});
+      const check = seekCheck.current;
+      if (check && now - check.at >= 1000) {
+        seekCheck.current = null;
+        const elapsed = (now - check.at) / 1000;
+        // Far from where the seek should have put it, but right where it would be without the seek.
+        const missed = Math.abs(actual - (check.target + elapsed)) > SEEK_MISS_S && Math.abs(actual - (check.from + elapsed)) < SEEK_MISS_S;
+        if (missed) {
+          seekMisses.current += 1;
+          logger.warn('sync', 'SEEK_MISSED', {from: +check.from.toFixed(3), target: +check.target.toFixed(3), actual: +actual.toFixed(3), misses: seekMisses.current});
+          if (seekMisses.current >= SEEK_MISSES_UNSEEKABLE && loadedUrl.current) {
+            unseekableUrls.add(loadedUrl.current);
+            setMediaNotice(UNSEEKABLE_NOTICE);
+            logger.warn('sync', 'UNSEEKABLE', {url: loadedUrl.current});
+          }
+        } else {
+          seekMisses.current = 0;
+        }
+      }
+      if (loadedUrl.current && unseekableUrls.has(loadedUrl.current)) {
+        // No watchdog or seek correction: a rebuild would restart the file at 0. Follow play/pause only.
+        if (s.isPlaying === p.isPaused() && now >= settleUntil.current) applyNow('unseekable-state');
+        return;
+      }
       // R17 watchdog, ahead of the settle window: a race shows on the first tick after a start, and
       // the player's own 'waiting' events would otherwise keep extending the settle window.
       if (s.isPlaying && !p.isPaused() && !p.isSeeking()) {
@@ -308,7 +382,9 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (chatOpen) {
+      if (libraryOpen) {
+        setLibraryOpen(false);
+      } else if (chatOpen) {
         setChatOpen(false);
       } else {
         logger.info('room', 'back → lobby');
@@ -317,7 +393,7 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       return true;
     });
     return () => sub.remove();
-  }, [chatOpen, onLeave]);
+  }, [chatOpen, libraryOpen, onLeave]);
 
   const sendPlayback = useCallback(
     (type: 'PLAY' | 'PAUSE' | 'SEEK', position: number) => {
@@ -337,11 +413,38 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     [showToast],
   );
 
+  const chooseMedia = useCallback(
+    (url: string, title: string) => {
+      const rs = roomSession.current;
+      if (!rs) return;
+      // Re-picking the current title would restart it for everyone; on a remote that is a mis-press.
+      if (url === state.current?.mediaUrl) {
+        setLibraryOpen(false);
+        showToast('Already playing');
+        return;
+      }
+      const result = rs.changeMedia(url);
+      if (result === 'forbidden') {
+        setLibraryOpen(false);
+        showToast("Only the host can change what's playing");
+      } else if (result === 'offline' || result === 'not-ready') {
+        showToast('Not connected — try again in a moment');
+      } else {
+        logger.info('room', 'sent CHANGE_MEDIA', {title});
+        setLibraryOpen(false);
+        showToast(`Now playing: ${title}`);
+      }
+      // 'sent' re-anchors the session at 0, paused; its playback event loads the URL (ensureMedia).
+    },
+    [showToast],
+  );
+
   useTVEventHandler((evt: HWEvent) => {
     if (evt.eventKeyAction !== undefined && evt.eventKeyAction !== 0) return; // act on key-down only
     const p = player.current;
     const s = state.current;
     logger.debug('keys', 'event', {type: evt.eventType});
+    if (libraryOpenRef.current) return;
     switch (evt.eventType) {
       // VVD delivers KEY_PLAYPAUSE as 'play' (not 'playpause' as TVTypes.d.ts documents).
       case 'playpause':
@@ -361,6 +464,11 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       case 'menu':
       case 'context_menu':
         setChatOpen((o) => !o);
+        break;
+      case 'down':
+        // Inox only offers the library to members who can control playback.
+        if (roomSession.current?.getState().canControl) setLibraryOpen(true);
+        else showToast("Only the host can change what's playing");
         break;
       case 'up':
         // Debug: cycle the rendition (auto → 0 → 1 → 2) to prove ABR level switching.
@@ -422,9 +530,14 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
           {chat.length === 0 ? <Text style={styles.chatLine}>No messages yet</Text> : null}
         </View>
       ) : null}
+      {libraryOpen ? <LibraryPanel currentUrl={view?.playback?.mediaUrl ?? ''} onChoose={chooseMedia} /> : null}
       {notice ? (
         <View style={styles.notice}>
           <Text style={styles.noticeText}>{notice}</Text>
+        </View>
+      ) : mediaNotice ? (
+        <View style={styles.mediaNotice}>
+          <Text style={styles.noticeText}>{mediaNotice}</Text>
         </View>
       ) : null}
       {toast ? (
@@ -452,6 +565,7 @@ const styles = StyleSheet.create({
   chatName: {color: color.accent, fontWeight: '700'},
   notice: {position: 'absolute', top: '45%', alignSelf: 'center', backgroundColor: color.overlay, borderRadius: radius.md, padding: space.lg, zIndex: 4},
   noticeText: {color: color.text, fontSize: font.body},
+  mediaNotice: {position: 'absolute', top: space.safeY, right: space.safeX, maxWidth: '40%', backgroundColor: color.overlay, borderRadius: radius.md, padding: space.md, zIndex: 2},
   toast: {position: 'absolute', bottom: space.xxl * 2, alignSelf: 'center', backgroundColor: color.surfaceRaised, borderRadius: radius.md, padding: space.md, zIndex: 5},
   toastText: {color: color.text, fontSize: font.body},
 });

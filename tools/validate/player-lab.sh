@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the dev player lab (apps/vega/src/dev/PlayerLab.tsx) on VVD for one stream and hls.js config,
 # saves its [lab] log lines, then restores the normal app config. Needs VVD, Metro and devlog running.
-#   tools/validate/player-lab.sh <name> <url> [level] [hls-config-json] [suite: basic|pause|resume|drift|fix|recovery]
+#   tools/validate/player-lab.sh <name> <url> [level] [hls-config-json] [suite: basic|pause|resume|drift|fix|recovery|file]
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 LOG="$ROOT/.devstack/logs/app-all.log"

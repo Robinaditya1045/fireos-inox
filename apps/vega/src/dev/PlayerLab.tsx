@@ -46,12 +46,13 @@ export const PlayerLab = ({url, level, hls: hlsConfig, suite = 'basic'}: {url: s
       const ready = new Promise<void>((done) => p.onReady(done));
       p.load(url, hlsConfig);
       const {hls, Events} = p.debugHandles();
-      if (level >= 0) hls.currentLevel = level;
-      hls.on(Events.FRAG_LOADING, (_e, d) => logger.info('lab', 'FRAG_LOADING', {trial, sn: d.frag.sn, lvl: d.frag.level, start: r3(d.frag.start), dur: r3(d.frag.duration)}));
-      hls.on(Events.FRAG_BUFFERED, (_e, d) => logger.info('lab', 'FRAG_BUFFERED', {trial, sn: d.frag.sn, lvl: d.frag.level, start: r3(d.frag.start), buf: ranges(video.buffered)}));
-      hls.on(Events.BUFFER_FLUSHING, (_e, d) => logger.info('lab', 'BUFFER_FLUSHING', {trial, start: r3(d.startOffset), end: r3(d.endOffset), type: d.type}));
-      hls.on(Events.LEVEL_SWITCHING, (_e, d) => logger.info('lab', 'LEVEL_SWITCHING', {trial, lvl: d.level}));
-      hls.on(Events.ERROR, (_e, d) => logger.info('lab', 'HLS_ERROR', {trial, details: d.details, fatal: !!d.fatal, t: r3(video.currentTime), buf: ranges(video.buffered)}));
+      // A single file (URL mode, D16) has no hls.js instance.
+      if (hls && level >= 0) hls.currentLevel = level;
+      if (hls) hls.on(Events.FRAG_LOADING, (_e, d) => logger.info('lab', 'FRAG_LOADING', {trial, sn: d.frag.sn, lvl: d.frag.level, start: r3(d.frag.start), dur: r3(d.frag.duration)}));
+      if (hls) hls.on(Events.FRAG_BUFFERED, (_e, d) => logger.info('lab', 'FRAG_BUFFERED', {trial, sn: d.frag.sn, lvl: d.frag.level, start: r3(d.frag.start), buf: ranges(video.buffered)}));
+      if (hls) hls.on(Events.BUFFER_FLUSHING, (_e, d) => logger.info('lab', 'BUFFER_FLUSHING', {trial, start: r3(d.startOffset), end: r3(d.endOffset), type: d.type}));
+      if (hls) hls.on(Events.LEVEL_SWITCHING, (_e, d) => logger.info('lab', 'LEVEL_SWITCHING', {trial, lvl: d.level}));
+      if (hls) hls.on(Events.ERROR, (_e, d) => logger.info('lab', 'HLS_ERROR', {trial, details: d.details, fatal: !!d.fatal, t: r3(video.currentTime), buf: ranges(video.buffered)}));
 
       const sampler = setInterval(() => {
         const t = video.currentTime;
@@ -362,7 +363,61 @@ export const PlayerLab = ({url, level, hls: hlsConfig, suite = 'basic'}: {url: s
         }],
       ];
 
-      const trials = ({pause: pauseSuite, resume: resumeSuite, drift: driftSuite, fix: fixSuite, recovery: recoverySuite} as Record<string, typeof basicSuite>)[suite] ?? basicSuite;
+      /**
+       * URL-mode seeks (D16): on VVD an MKV seemed to ignore seeks made while paused. Each trial seeks
+       * from a known playing position and reports where playback really continues.
+       */
+      const seekTrial = (name: string, from: number, to: number, how: 'paused' | 'playing' | 'play-then-seek' | 'paused-await-seeked', waitMs = 300): [string, () => Promise<void>] => [
+        `${name}:${from}->${to}${how === 'paused' ? `+${waitMs}ms` : ''}`,
+        async () => {
+          p.play();
+          p.seek(from);
+          await advancing(from, 8000);
+          if (how === 'playing') {
+            const at = Date.now();
+            p.seek(to);
+            await measure(trial, to, at, 3);
+            return;
+          }
+          p.pause();
+          await sleep(500);
+          if (how === 'play-then-seek') {
+            const at = Date.now();
+            p.play();
+            p.seek(to);
+            await measure(trial, to, at, 3);
+            return;
+          }
+          const t0 = Date.now();
+          let seeked = false;
+          const onSeeked = () => (seeked = true);
+          video.addEventListener('seeked', onSeeked);
+          p.seek(to);
+          if (how === 'paused-await-seeked') {
+            while (!seeked && Date.now() - t0 < 8000) await sleep(50);
+          } else {
+            await sleep(waitMs);
+          }
+          video.removeEventListener('seeked', onSeeked);
+          logger.info('lab', 'BEFORE_PLAY', {trial, t: r3(video.currentTime), seeked, seekedMs: Date.now() - t0, seeking: video.seeking, rs: video.readyState});
+          const at = Date.now();
+          p.play();
+          await measure(trial, to, at, 3);
+        },
+      ];
+      const fileSuite: Array<[string, () => Promise<void>]> = [
+        play0,
+        seekTrial('fwd', 3, 20, 'paused', 300),
+        seekTrial('fwd', 3, 20, 'paused', 4000),
+        seekTrial('fwd', 3, 20, 'paused-await-seeked'),
+        seekTrial('back', 30, 10, 'paused', 300),
+        seekTrial('back', 30, 10, 'paused-await-seeked'),
+        seekTrial('fwd', 3, 25, 'playing'),
+        seekTrial('fwd', 3, 25, 'play-then-seek'),
+        seekTrial('fwd', 3, 20, 'paused', 300),
+      ];
+
+      const trials = ({file: fileSuite, pause: pauseSuite, resume: resumeSuite, drift: driftSuite, fix: fixSuite, recovery: recoverySuite} as Record<string, typeof basicSuite>)[suite] ?? basicSuite;
       logger.info('lab', 'SUITE', {suite, trials: trials.map(([n]) => n)});
       for (const [name, run] of trials) {
         if (stopped) return;
