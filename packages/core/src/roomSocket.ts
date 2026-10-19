@@ -74,6 +74,19 @@ export class RoomSocket {
     this.setState('closed');
   }
 
+  /**
+   * Skips the rest of the backoff wait (a Retry button). The attempt count is kept, so a failed
+   * retry backs off as it would have. No-op unless a reconnect timer is pending: not while open or
+   * connecting, during the pre-reconnect session check, after close() or once unauthorized.
+   */
+  retryNow(): void {
+    if (this.stopped || this.state !== 'reconnecting' || !this.retryTimer) return;
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.deps.logger.info('socket', 'retrying now', { attempt: this.attempt });
+    this.open();
+  }
+
   /** Returns false when the socket is not open; playback events are never queued. */
   send<T>(type: WSEventType, payload: T): boolean {
     if (!this.ws || this.ws.readyState !== OPEN) return false;
@@ -149,7 +162,10 @@ export class RoomSocket {
     if (this.stopped) return;
     const delay = backoffDelay(this.attempt, this.deps.random);
     this.deps.logger.info('socket', 'reconnect scheduled', { attempt: this.attempt, delay });
-    this.retryTimer = setTimeout(() => this.open(), delay);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null; // pending-ness is what retryNow() checks
+      this.open();
+    }, delay);
   }
 
   private clearTimers(): void {

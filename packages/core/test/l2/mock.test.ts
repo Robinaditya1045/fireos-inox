@@ -2,7 +2,19 @@
 // with Node's own fetch and WebSocket standing in for the platform's.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { startMock } from '../../../../tools/mock-inox/src/mock.mjs';
-import { createApi, createRoomSession, libraryEntries, playUrl, RoomSocket, type RoomEvent, type RoomSession, type Session, type WebSocketCtor } from '../../src';
+import {
+  createApi,
+  createRoomSession,
+  isReaction,
+  libraryEntries,
+  playUrl,
+  RoomSocket,
+  type ChatMessage,
+  type RoomEvent,
+  type RoomSession,
+  type Session,
+  type WebSocketCtor,
+} from '../../src';
 import { fakeLogger } from '../helpers';
 
 type Mock = Awaited<ReturnType<typeof startMock>>;
@@ -221,7 +233,7 @@ describe('L2: core against mock-inox', () => {
   it('chat: live messages arrive, and history is there on the next entry', async () => {
     const tv = await participant(tvEmail());
     const host = await participant(hostEmail());
-    // The TV's chat is read-only in the MVP; the host speaks through the raw socket envelope.
+    // The host speaks through the raw socket envelope, as Inox's web client does.
     const ws = new WebSocket(`${mock.wsUrl}/rooms/${mock.roomId}/ws?session_id=${await loginId(hostEmail())}`);
     await new Promise((r) => ws.addEventListener('open', r, { once: true }));
     ws.send(JSON.stringify({ type: 'CHAT_MESSAGE', payload: { message: 'popcorn?' }, timestamp: Date.now() }));
@@ -231,6 +243,80 @@ describe('L2: core against mock-inox', () => {
     tv.rs.leave();
     const again = await participant(tvEmail());
     expect(again.rs.getState().chat.filter((m) => m.message === 'popcorn?')).toHaveLength(1);
+  });
+});
+
+describe('L2: Couch Reactions (D17)', () => {
+  type LoggedEvent = { at: number; user_id: string; type: string; payload: unknown };
+  const chatEventsSince = async (since: number, userId: string) =>
+    ((await control('events')) as { events: LoggedEvent[] }).events.filter((e) => e.at >= since && e.user_id === userId && e.type === 'CHAT_MESSAGE');
+  const chatEvents = (events: RoomEvent[]) => events.flatMap((e) => (e.type === 'chat' ? [e.message] : []));
+
+  it('a TV reaction reaches the host with the TV as sender, and is saved', async () => {
+    const tv = await participant(tvEmail());
+    const host = await participant(hostEmail());
+    const mine = (list: ChatMessage[]) => list.filter((m) => m.user_id === tv.me.userId && m.message === '😂').length;
+    const savedBefore = mine(await host.api.getMessages(mock.roomId, 100));
+    const sentAt = Date.now();
+    expect(tv.rs.getState().canChat).toBe(true); // a member, without playback control
+    expect(tv.rs.sendChat('😂')).toBe('sent');
+    const got = await waitFor(() => chatEvents(host.events).find((m) => m.message === '😂'), 2000, 'host to get the reaction');
+    expect(Date.now() - sentAt).toBeLessThan(1000);
+    expect(got).toMatchObject({ user_id: tv.me.userId, username: 'couch' });
+    // Not optimistic: the TV shows its own reaction from the echo.
+    await waitFor(() => chatEvents(tv.events).find((m) => m.message === '😂' && m.user_id === tv.me.userId), 2000, 'own echo');
+    expect(mine(await host.api.getMessages(mock.roomId, 100))).toBe(savedBefore + 1);
+  });
+
+  it('a host reaction floats on the TV', async () => {
+    const tv = await participant(tvEmail());
+    const host = await participant(hostEmail());
+    expect(host.rs.sendChat('🔥')).toBe('sent');
+    const got = await waitFor(() => chatEvents(tv.events).find((m) => m.user_id === host.me.userId), 2000, 'TV to get the reaction');
+    expect(got).toMatchObject({ username: 'host', message: '🔥' });
+    expect(isReaction(got.message)).toBe(true);
+  });
+
+  it('two quick sends: the second is throttled and never reaches the server', async () => {
+    const since = Date.now();
+    const tv = await participant(tvEmail());
+    expect(tv.rs.sendChat('👏')).toBe('sent');
+    expect(tv.rs.sendChat('😮')).toBe('throttled');
+    await waitFor(() => chatEvents(tv.events).find((m) => m.message === '👏'), 2000, 'the echo of the first send');
+    await new Promise((r) => setTimeout(r, 200));
+    expect((await chatEventsSince(since, tv.me.userId)).map((e) => e.payload)).toEqual([{ message: '👏' }]);
+  });
+
+  it('a muted member gets forbidden and sends nothing', async () => {
+    const since = Date.now();
+    expect(await control('permissions', `?user=${encodeURIComponent(tvEmail())}&can_send_messages=false`)).toMatchObject({ user: 'couch', permissions: { can_send_messages: false } });
+    const tv = await participant(tvEmail());
+    expect(tv.rs.getState().canChat).toBe(false);
+    expect(tv.rs.sendChat('😂')).toBe('forbidden');
+    await new Promise((r) => setTimeout(r, 200));
+    expect(await chatEventsSince(since, tv.me.userId)).toEqual([]);
+  });
+
+  it('mock mirrors Inox: chat Inox would not save is still broadcast (why the client enforces the rules)', async () => {
+    const host = await participant(hostEmail());
+    await participant(tvEmail()); // joins the room
+    await control('permissions', '?user=couch&can_send_messages=false');
+    const raw = new WebSocket(`${mock.wsUrl}/rooms/${mock.roomId}/ws?session_id=${await loginId(tvEmail())}`);
+    await new Promise((r) => raw.addEventListener('open', r, { once: true }));
+    const tag = `muted-${Date.now()}`;
+    const long = `long-${Date.now()}-${'é'.repeat(1000)}`; // > 2000 UTF-8 bytes
+    raw.send(JSON.stringify({ type: 'CHAT_MESSAGE', payload: { message: tag }, timestamp: Date.now() }));
+    await waitFor(() => host.rs.getState().chat.find((m) => m.message === tag), 2000, 'muted chat to be broadcast');
+    await control('permissions', '?user=couch&can_send_messages=true');
+    raw.send(JSON.stringify({ type: 'CHAT_MESSAGE', payload: { message: long }, timestamp: Date.now() + 1 }));
+    raw.send(JSON.stringify({ type: 'CHAT_MESSAGE', payload: { message: `  ${tag}-ok  ` }, timestamp: Date.now() + 2 }));
+    await waitFor(() => host.rs.getState().chat.find((m) => m.message === `  ${tag}-ok  `), 2000, 'untrimmed broadcast');
+    expect(host.rs.getState().chat.some((m) => m.message === long)).toBe(true);
+    raw.close();
+    const saved = (await host.api.getMessages(mock.roomId, 100)).map((m) => m.message);
+    expect(saved).not.toContain(tag);
+    expect(saved).not.toContain(long);
+    expect(saved).toContain(`${tag}-ok`); // saved trimmed
   });
 });
 

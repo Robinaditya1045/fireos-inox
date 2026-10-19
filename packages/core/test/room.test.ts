@@ -16,7 +16,7 @@ import { fakeLogger, msg } from './helpers';
 const NOW = 1_760_000_000_000;
 const ME = { userId: 'me', username: 'couch' };
 
-const member = (canControl: boolean): RoomMember => ({
+const member = (canControl: boolean, canChat = true): RoomMember => ({
   room_id: 'r1',
   user_id: 'me',
   role: canControl ? 'moderator' : 'member',
@@ -26,7 +26,7 @@ const member = (canControl: boolean): RoomMember => ({
     can_stream_audio: true,
     can_stream_video: true,
     can_share_screen: false,
-    can_send_messages: true,
+    can_send_messages: canChat,
     can_invite_users: false,
     can_kick_users: false,
     can_manage_roles: false,
@@ -45,8 +45,11 @@ const synced = () => ws(initialRoomState('r1', ME), sync());
 
 describe('roomReducer', () => {
   it('entered: takes permissions and history', () => {
+    expect(initialRoomState('r1', ME).canChat).toBe(false);
     const s = roomReducer(initialRoomState('r1', ME), { type: 'entered', room, member: member(true), history: [chatMsg('1', 'a'), chatMsg('2', 'b')] });
     expect(s.canControl).toBe(true);
+    expect(s.canChat).toBe(true);
+    expect(roomReducer(initialRoomState('r1', ME), { type: 'entered', room, member: member(true, false), history: [] }).canChat).toBe(false);
     expect(s.chat.map((c) => c.id)).toEqual(['1', '2']);
   });
 
@@ -77,7 +80,13 @@ describe('roomReducer', () => {
     const s1 = ws(synced(), echo);
     expect(s1.chat).toHaveLength(1);
     expect(s1.chat[0]).toMatchObject({ user_id: 'me', username: 'couch', message: 'hi' });
-    expect(ws(s1, echo).chat).toHaveLength(1);
+    expect(ws(s1, echo)).toBe(s1);
+  });
+
+  it('skips blank chat frames, as the web client does', () => {
+    const s = synced();
+    expect(ws(s, msg('CHAT_MESSAGE', { message: '' }, { sender_id: 'host', timestamp: NOW }))).toBe(s);
+    expect(ws(s, msg('CHAT_MESSAGE', { message: ' \n ' }, { sender_id: 'host', timestamp: NOW }))).toBe(s);
   });
 
   it(`caps chat at ${CHAT_CAP}, keeping the newest`, () => {
@@ -127,6 +136,7 @@ function fakeSocket() {
   return {
     sent,
     socket: {
+      retryNow: vi.fn(),
       connect: vi.fn(() => {
         open = true;
         onState('open');
@@ -157,19 +167,21 @@ function fakeSocket() {
   };
 }
 
-function session(canControl = false, over: Partial<{ joinRoom: () => Promise<unknown> }> = {}) {
+function session(canControl = false, over: Partial<{ joinRoom: () => Promise<unknown>; canChat: boolean }> = {}) {
   const fs = fakeSocket();
+  const clock = { now: NOW };
+  const canChat = over.canChat ?? true;
   const { logger, lines } = fakeLogger();
   const calls: string[] = [];
   const api = {
     joinRoom: vi.fn(async () => {
       calls.push('join');
       if (over.joinRoom) await over.joinRoom();
-      return member(canControl);
+      return member(canControl, canChat);
     }),
     getRoom: vi.fn(async () => {
       calls.push('getRoom');
-      return { room, member: member(canControl) };
+      return { room, member: member(canControl, canChat) };
     }),
     getMessages: vi.fn(async () => {
       calls.push('getMessages');
@@ -182,12 +194,12 @@ function session(canControl = false, over: Partial<{ joinRoom: () => Promise<unk
       calls.push('socket');
       return fs.socket;
     },
-    now: () => NOW,
+    now: () => clock.now,
     logger,
   });
   const events: RoomEvent[] = [];
   rs.subscribe((_s, e) => events.push(e));
-  return { rs, fs, calls, lines, events };
+  return { rs, fs, calls, lines, events, clock };
 }
 
 describe('createRoomSession', () => {
@@ -222,7 +234,11 @@ describe('createRoomSession', () => {
     fs.deliver(sync());
     fs.deliver(msg('CHAT_MESSAGE', { message: 'x' }, { sender_id: 'host', timestamp: 1 }));
     fs.deliver(msg('SEEK', { media_time_seconds: 50 }, { sender_id: 'host' }));
-    expect(events).toEqual([{ type: 'playback', reason: 'SYNC_PLAYBACK' }, { type: 'state' }, { type: 'playback', reason: 'SEEK' }]);
+    expect(events).toEqual([
+      { type: 'playback', reason: 'SYNC_PLAYBACK' },
+      { type: 'chat', message: expect.objectContaining({ message: 'x' }) },
+      { type: 'playback', reason: 'SEEK' },
+    ]);
   });
 
   it('declines live leadership when named leader', async () => {
@@ -319,6 +335,115 @@ describe('createRoomSession', () => {
       fs.deliver(msg('CHANGE_MEDIA', { media_url: 'v', media_time_seconds: 0, is_playing: false }, { sender_id: 'me' }));
       expect(rs.getState()).toBe(after);
     });
+  });
+
+  describe('sendChat', () => {
+    const chatFrame = (text: string, sender = 'host', timestamp = NOW) => msg('CHAT_MESSAGE', { message: text }, { sender_id: sender, sender_name: sender, timestamp });
+
+    it('is not-ready before entering', () => {
+      const { rs, fs } = session();
+      expect(rs.sendChat('hi')).toBe('not-ready');
+      expect(fs.sent).toEqual([]);
+    });
+
+    it('is forbidden without can_send_messages, before looking at the text', async () => {
+      const { rs, fs } = session(false, { canChat: false });
+      await rs.enter();
+      expect(rs.getState().canChat).toBe(false);
+      expect(rs.sendChat('😂')).toBe('forbidden');
+      expect(rs.sendChat('')).toBe('forbidden');
+      expect(fs.sent).toEqual([]);
+    });
+
+    it('checks the text: empty, too long (UTF-8 bytes)', async () => {
+      const { rs, fs } = session();
+      await rs.enter();
+      expect(rs.sendChat('   ')).toBe('empty');
+      expect(rs.sendChat('😂'.repeat(501))).toBe('too-long');
+      expect(fs.sent).toEqual([]);
+    });
+
+    it('needs no playback control and no SYNC_PLAYBACK; sends the trimmed text and is not optimistic', async () => {
+      const { rs, fs, events } = session(false);
+      await rs.enter();
+      events.length = 0;
+      expect(rs.sendChat('  Pause please!  ')).toBe('sent');
+      expect(fs.sent).toEqual([{ type: 'CHAT_MESSAGE', payload: { message: 'Pause please!' } }]);
+      expect(rs.getState().chat.map((m) => m.message)).toEqual(['hello']);
+      expect(events).toEqual([]);
+    });
+
+    it('throttles to one send per second, counting only sends that went out', async () => {
+      const { rs, fs, clock } = session();
+      await rs.enter();
+      expect(rs.sendChat('😂')).toBe('sent');
+      clock.now += 999;
+      expect(rs.sendChat('🔥')).toBe('throttled');
+      // A refused text does not restart the window either.
+      expect(rs.sendChat('')).toBe('empty');
+      clock.now += 1;
+      expect(rs.sendChat('🔥')).toBe('sent');
+      fs.drop();
+      clock.now += 5000;
+      expect(rs.sendChat('👏')).toBe('offline');
+      expect(fs.sent.map((f) => f.payload)).toEqual([{ message: '😂' }, { message: '🔥' }]);
+    });
+
+    it('offline does not start the throttle window', async () => {
+      const { rs, fs, clock } = session();
+      await rs.enter();
+      fs.drop();
+      expect(rs.sendChat('a')).toBe('offline');
+      fs.socket.connect();
+      clock.now += 10;
+      expect(rs.sendChat('a')).toBe('sent');
+    });
+
+    it("emits 'chat' once per new live message, including the own echo; not for history or duplicates", async () => {
+      const { rs, fs, events } = session();
+      await rs.enter();
+      // The history ('hello') arrived as a plain state change.
+      expect(events.filter((e) => e.type === 'chat')).toEqual([]);
+      events.length = 0;
+      fs.deliver(chatFrame('😂'));
+      fs.deliver(chatFrame('😂')); // same sender + timestamp: a duplicate
+      fs.deliver(chatFrame('🔥', 'me', NOW + 5)); // own echo
+      fs.deliver(chatFrame('  ', 'host', NOW + 6)); // blank: dropped
+      expect(events).toEqual([
+        { type: 'chat', message: expect.objectContaining({ user_id: 'host', message: '😂' }) },
+        { type: 'chat', message: expect.objectContaining({ user_id: 'me', username: 'me', message: '🔥' }) },
+      ]);
+    });
+
+    it("still emits 'chat' when the chat is at its cap", async () => {
+      const { rs, fs, events } = session();
+      await rs.enter();
+      for (let i = 0; i < CHAT_CAP; i++) fs.deliver(chatFrame(`m${i}`, 'host', NOW + i));
+      events.length = 0;
+      fs.deliver(chatFrame('last', 'host', NOW + CHAT_CAP));
+      expect(events).toEqual([{ type: 'chat', message: expect.objectContaining({ message: 'last' }) }]);
+    });
+
+    it("keeps 'playback' and 'state' as they were around chat", async () => {
+      const { rs, fs, events } = session();
+      await rs.enter();
+      events.length = 0;
+      fs.deliver(sync());
+      fs.deliver(chatFrame('x'));
+      fs.deliver(msg('JOIN_ROOM', undefined, { sender_id: 'guest' }));
+      expect(events.map((e) => e.type)).toEqual(['playback', 'chat', 'state']);
+    });
+  });
+
+  it('retryConnection asks the socket to retry; a no-op before enter and after leave', async () => {
+    const { rs, fs } = session();
+    rs.retryConnection();
+    await rs.enter();
+    rs.retryConnection();
+    expect(fs.socket.retryNow).toHaveBeenCalledOnce();
+    rs.leave();
+    rs.retryConnection();
+    expect(fs.socket.retryNow).toHaveBeenCalledOnce();
   });
 
   it('leave closes the socket', async () => {

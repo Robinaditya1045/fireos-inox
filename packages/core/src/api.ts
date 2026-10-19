@@ -55,7 +55,8 @@ export function createApi(deps: ApiDeps) {
       } catch {
         // non-JSON body: keep the raw text
       }
-      if (res.status === 401) deps.onUnauthorized?.();
+      // A 401 ends a session only if the request carried one: a wrong password at sign-in is also a 401.
+      if (res.status === 401 && session) deps.onUnauthorized?.();
       throw new ApiError(res.status, message);
     }
     return (text ? JSON.parse(text) : null) as T;

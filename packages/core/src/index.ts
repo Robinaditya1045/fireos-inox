@@ -5,3 +5,5 @@ export * from './roomSocket';
 export * from './sync';
 export * from './room';
 export * from './library';
+export * from './chat';
+export * from './lobby';

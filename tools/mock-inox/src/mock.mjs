@@ -4,7 +4,7 @@
 //
 // Every faked behaviour names the Inox file it mirrors (paths under backend/internal/, commit 321f83b).
 // When Inox and this file disagree, Inox is right: fix this file.
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { createReadStream, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
@@ -50,6 +50,12 @@ export function permissionsForRole(role) {
   }
 }
 
+// room/chat_service.go SaveMessage: strings.TrimSpace, then 1..2000 by Go's len() (UTF-8 bytes).
+// Go's unicode.IsSpace set; JS trim() would also strip U+FEFF and keep U+0085.
+const GO_SPACE = '\\t\\n\\v\\f\\r \\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000';
+const GO_TRIM = new RegExp(`^[${GO_SPACE}]+|[${GO_SPACE}]+$`, 'g');
+const CHAT_MAX_BYTES = 2000;
+
 const CONTENT_TYPES = { '.m3u8': 'application/vnd.apple.mpegurl', '.ts': 'video/mp2t', '.m4s': 'video/iso.segment', '.mp4': 'video/mp4' };
 
 /**
@@ -74,7 +80,9 @@ export async function startMock(opts = {}) {
   const sessions = new Map();
   const authHits = new Map();
 
-  const roomMembers = new Map([[hostUser.id, { role: 'owner', joined_at: startedAt }]]);
+  // room/repository.go: role and permissions are stored per member row; AssignRole (room/service.go)
+  // writes the role's defaults or a custom set.
+  const roomMembers = new Map([[hostUser.id, { role: 'owner', permissions: permissionsForRole('owner'), joined_at: startedAt }]]);
   let publicBase = '';
   const mediaUrl = () => `${publicBase}/media/stream/${FIXTURE_MASTER}`;
   const room = { id: ROOM_ID, name: 'Movie Night', owner_id: hostUser.id, is_private: false, created_at: startedAt, updated_at: startedAt };
@@ -88,6 +96,8 @@ export async function startMock(opts = {}) {
   const clients = new Set();
 
   const faults = { latencyMs: 0, slowHlsMs: 0, hls404: false };
+  /** Members whose permissions /__control/permissions edited, restored by /__control/reset. */
+  const overridden = new Set();
   const resetFaults = () => Object.assign(faults, { latencyMs: 0, slowHlsMs: 0, hls404: false });
 
   // ---------- helpers ----------
@@ -138,7 +148,7 @@ export async function startMock(opts = {}) {
     const m = roomMembers.get(userId);
     if (!m) return null;
     const user = users.find((u) => u.id === userId);
-    return { room_id: ROOM_ID, user_id: userId, username: user?.username, role: m.role, permissions: permissionsForRole(m.role), joined_at: m.joined_at };
+    return { room_id: ROOM_ID, user_id: userId, username: user?.username, role: m.role, permissions: { ...m.permissions }, joined_at: m.joined_at };
   }
 
   function roomJson() {
@@ -225,6 +235,21 @@ export async function startMock(opts = {}) {
     }
   }
 
+  /**
+   * ws/hub.go dispatchLocal → room/chat_service.go SaveMessage. Saving can fail (blank, too long,
+   * sender without can_send_messages) and the hub ignores the error: the frame is fanned out
+   * regardless, with its payload untouched (untrimmed). Only the saved copy is trimmed.
+   */
+  function saveChat(client, payload) {
+    if (typeof payload?.message !== 'string') return; // json.Unmarshal into ChatPayload fails
+    const text = payload.message.replace(GO_TRIM, '');
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (bytes === 0 || bytes > CHAT_MAX_BYTES) return;
+    if (!roomMembers.get(client.userId)?.permissions.can_send_messages) return;
+    // chat_service.go: the ID is 16 random bytes, hex-encoded.
+    chat.push({ id: randomBytes(16).toString('hex'), room_id: ROOM_ID, user_id: client.userId, username: client.username, message: text, created_at: iso() });
+  }
+
   function onClientFrame(client, raw) {
     let parsed;
     try {
@@ -243,9 +268,7 @@ export async function startMock(opts = {}) {
       if (parsed.payload?.unable) declines.push({ at: now(), user_id: client.userId });
       return;
     }
-    if (parsed.type === 'CHAT_MESSAGE' && typeof parsed.payload?.message === 'string') {
-      chat.push({ id: randomUUID(), room_id: ROOM_ID, user_id: client.userId, username: client.username, message: parsed.payload.message, created_at: iso() });
-    }
+    if (parsed.type === 'CHAT_MESSAGE') saveChat(client, parsed.payload);
     applyToState(parsed.type, parsed.payload);
     // The server overwrites sender_id/sender_name/room_id and fans out to everyone, sender included.
     deliver({ ...parsed, room_id: ROOM_ID, sender_id: client.userId, sender_name: client.username, timestamp: parsed.timestamp ?? 0 });
@@ -279,7 +302,7 @@ export async function startMock(opts = {}) {
   // ---------- control API (mock only) ----------
   async function control(scenario, url, res) {
     const userParam = url.searchParams.get('user');
-    const pick = (v) => users.find((u) => u.id === v || u.username === v);
+    const pick = (v) => users.find((u) => u.id === v || u.username === v || u.email === v);
     switch (scenario) {
       case 'drop-sockets':
         // terminate() closes without a close frame, so clients see 1006 like a network loss.
@@ -329,8 +352,28 @@ export async function startMock(opts = {}) {
       case 'hls-404':
         faults.hls404 = true;
         return send(res, 200, { hls404: true });
+      case 'permissions': {
+        // A host editing a member's capability flags in the web UI: PUT /rooms/{id}/members/{user}/role
+        // with custom permissions (api/handler/room.go AssignRole → room/service.go). Takes effect for
+        // chat at once (SaveMessage reads the member row); clients see it on their next GET /rooms/{id}.
+        const target = pick(userParam ?? 'couch');
+        const m = target && roomMembers.get(target.id);
+        if (!m) return fail(res, 404, 'not a member of this room');
+        for (const key of Object.keys(ALL_PERMISSIONS)) {
+          const v = url.searchParams.get(key);
+          if (v === 'true' || v === 'false') m.permissions[key] = v === 'true';
+        }
+        overridden.add(target.id);
+        return send(res, 200, { user: target.username, permissions: { ...m.permissions } });
+      }
       case 'reset':
         resetFaults();
+        // Permission edits are injected faults too: back to each member's role defaults.
+        for (const id of overridden) {
+          const m = roomMembers.get(id);
+          if (m) m.permissions = permissionsForRole(m.role);
+        }
+        overridden.clear();
         return send(res, 200, { reset: true });
       case 'events':
         return send(res, 200, { events, playback: { ...playback }, connected: [...clients].map((c) => c.username) });
@@ -401,7 +444,7 @@ export async function startMock(opts = {}) {
       if (method === 'POST' && rest === '/join') {
         if (roomId !== ROOM_ID) return fail(res, 500, 'failed to join room');
         // api/handler/room.go JoinRoom: idempotent, new members get role "member".
-        if (!roomMembers.has(user.id)) roomMembers.set(user.id, { role: 'member', joined_at: iso() });
+        if (!roomMembers.has(user.id)) roomMembers.set(user.id, { role: 'member', permissions: permissionsForRole('member'), joined_at: iso() });
         return send(res, 200, memberJson(user.id));
       }
       // api/middleware/rbac.go RequireRoomMembership.
@@ -457,10 +500,10 @@ export async function startMock(opts = {}) {
     roomId: ROOM_ID,
     password,
     users: { host: { ...hostUser }, tv: { ...tvUser } },
-    /** Test hook: set a member's role, as a host promoting someone in the web UI would. */
+    /** Test hook: set a member's role, as a host promoting someone in the web UI would (AssignRole: the role's default permissions). */
     setRole(username, role) {
       const u = users.find((x) => x.username === username);
-      if (u) roomMembers.set(u.id, { role, joined_at: roomMembers.get(u.id)?.joined_at ?? iso() });
+      if (u) roomMembers.set(u.id, { role, permissions: permissionsForRole(role), joined_at: roomMembers.get(u.id)?.joined_at ?? iso() });
     },
     async close() {
       for (const c of clients) c.ws.terminate();

@@ -146,6 +146,61 @@ describe('RoomSocket', () => {
     expect(FakeWebSocket.last().sent).toHaveLength(1);
   });
 
+  describe('retryNow', () => {
+    it('skips the pending backoff wait and keeps the attempt count', () => {
+      const { socket, lines } = makeSocket();
+      socket.connect();
+      FakeWebSocket.last().serverDrop(); // attempt 1: 1 s
+      vi.advanceTimersByTime(1000);
+      FakeWebSocket.last().serverDrop(); // attempt 2: 2 s
+      vi.advanceTimersByTime(500);
+      expect(FakeWebSocket.instances.length).toBe(2);
+      socket.retryNow();
+      expect(FakeWebSocket.instances.length).toBe(3);
+      expect(socket.getState()).toBe('reconnecting');
+      // The cancelled timer must not open a second socket.
+      vi.advanceTimersByTime(5000);
+      expect(FakeWebSocket.instances.length).toBe(3);
+      // A failed retry backs off as attempt 3 (4 s), not from the start.
+      FakeWebSocket.last().serverDrop();
+      vi.advanceTimersByTime(3999);
+      expect(FakeWebSocket.instances.length).toBe(3);
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.instances.length).toBe(4);
+      expect(lines.some((l) => l.msg === 'retrying now')).toBe(true);
+    });
+
+    it('is a no-op while open, connecting, mid-attempt, closed or unauthorized', async () => {
+      const { socket } = makeSocket();
+      socket.retryNow(); // idle
+      socket.connect();
+      socket.retryNow(); // connecting
+      FakeWebSocket.last().serverOpen();
+      socket.retryNow(); // open
+      expect(FakeWebSocket.instances.length).toBe(1);
+      FakeWebSocket.last().serverDrop();
+      vi.advanceTimersByTime(1000); // the timer fired: attempt 1 is connecting, state still 'reconnecting'
+      expect(FakeWebSocket.instances.length).toBe(2);
+      socket.retryNow();
+      expect(FakeWebSocket.instances.length).toBe(2);
+      FakeWebSocket.last().serverDrop();
+      socket.close();
+      socket.retryNow(); // closed
+      vi.advanceTimersByTime(60_000);
+      expect(FakeWebSocket.instances.length).toBe(2);
+
+      const other = makeSocket({ checkSession: async () => false });
+      const base = FakeWebSocket.instances.length;
+      other.socket.connect();
+      FakeWebSocket.last().serverDrop();
+      other.socket.retryNow(); // during the session check: no timer yet
+      await vi.advanceTimersByTimeAsync(0);
+      expect(other.states.at(-1)).toBe('unauthorized');
+      other.socket.retryNow();
+      expect(FakeWebSocket.instances.length).toBe(base + 1);
+    });
+  });
+
   it('close stops reconnecting', () => {
     const { socket, states } = makeSocket();
     socket.connect();

@@ -97,6 +97,14 @@ export function correction(expected: number, actual: number, inSettleWindow: boo
   return { seek: !inSettleWindow && Math.abs(drift) > DRIFT_SEEK_THRESHOLD_S, drift };
 }
 
+export type SyncStatus = 'in-sync' | 'catching-up' | 'unknown';
+
+/** The room banner's sync indicator (D17), on the same threshold that triggers a corrective seek. */
+export function syncStatus(driftS: number | null): SyncStatus {
+  if (driftS === null || Number.isNaN(driftS)) return 'unknown';
+  return Math.abs(driftS) <= DRIFT_SEEK_THRESHOLD_S ? 'in-sync' : 'catching-up';
+}
+
 /**
  * Drift ladder, after Inox's live-sync ladder (frontend/src/utils/liveSync.ts): a seek costs a
  * rebuffer (~2.3 s measured on VVD), so small gaps are closed by playback rate (verified to work on

@@ -10,6 +10,7 @@ import {
   isOwnEcho,
   nextLead,
   shouldDeclineLeadership,
+  syncStatus,
   type PlaybackState,
 } from '../src';
 import { msg } from './helpers';
@@ -138,5 +139,17 @@ describe('live leadership', () => {
 
   it('payload matches inox-contract.md §4', () => {
     expect(declineLeadershipPayload()).toEqual({ position: { sn: 0, cc: 0, offset: 0 }, age_ms: 0, unable: true });
+  });
+});
+
+describe('syncStatus', () => {
+  it('is unknown without a measurement', () => {
+    expect(syncStatus(null)).toBe('unknown');
+    expect(syncStatus(NaN)).toBe('unknown');
+  });
+
+  it('is in sync up to the seek threshold either way, catching up beyond it', () => {
+    for (const d of [0, 0.2, -0.2, 0.5, -0.5]) expect(syncStatus(d)).toBe('in-sync');
+    for (const d of [0.51, -0.51, 3, -40]) expect(syncStatus(d)).toBe('catching-up');
   });
 });

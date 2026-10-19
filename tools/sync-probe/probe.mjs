@@ -2,6 +2,7 @@
 // Scripted room participant for the local stack (docs/dev/testing.md).
 //   node tools/sync-probe/probe.mjs [--as host|tv] listen
 //   node tools/sync-probe/probe.mjs [--as host|tv] send <TYPE> '<json payload>'
+//     e.g. send CHAT_MESSAGE '{"message":"😂"}'   (a reaction, D17; any CHAT_MESSAGE text works)
 //   node tools/sync-probe/probe.mjs [--as host|tv] script <file.json>   # [{"at":ms,"type":..,"payload":..}]
 // Credentials and room come from .devstack/seed-credentials.json and .devstack/seed-output.json.
 // Each received event is printed as "<recvEpochMs> <json>".

@@ -41,6 +41,12 @@ describe('createApi', () => {
     expect(onUnauthorized).toHaveBeenCalledOnce();
   });
 
+  it('a 401 to a request without a session (wrong password) is not a session end', async () => {
+    const { api, onUnauthorized } = setup(async () => respond(401, { error: 'invalid email or password' }), null);
+    await expect(api.login('a@b.c', 'wrong')).rejects.toMatchObject({ status: 401, message: 'invalid email or password' });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
   it('keeps a non-JSON error body as the message, without onUnauthorized for other statuses', async () => {
     const { api, onUnauthorized } = setup(async () => respond(502, 'Bad Gateway'));
     await expect(api.listRooms()).rejects.toMatchObject({ status: 502, message: 'Bad Gateway' });

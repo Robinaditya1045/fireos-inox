@@ -58,6 +58,11 @@ const KNOWN_TITLES: Record<string, string> = {
 // File names that say what a file is for rather than what is in it.
 const GENERIC_NAME = /^(master|index|playlist|stream|movie|video|output|media)\.[a-z0-9]{2,5}$/i;
 
+/** The display name of a well-known stream that is not a library entry, if this is one. */
+export function knownTitle(url: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(KNOWN_TITLES, url) ? KNOWN_TITLES[url] : undefined;
+}
+
 function decode(segment: string): string {
   try {
     return decodeURIComponent(segment);
@@ -68,7 +73,7 @@ function decode(segment: string): string {
 
 /** "…/bunny/movie.mp4" → "movie"; "…/big-buck-bunny/master.m3u8" → "big buck bunny". */
 export function titleFromUrl(url: string): string {
-  const known = KNOWN_TITLES[url];
+  const known = knownTitle(url);
   if (known) return known;
   const path = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*([^?#]*)/i.exec(url)?.[1];
   if (path === undefined) return url;

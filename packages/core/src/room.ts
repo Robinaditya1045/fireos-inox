@@ -1,4 +1,5 @@
 import type { Api } from './api';
+import { CHAT_MIN_INTERVAL_MS, checkChatText, trimChat } from './chat';
 import type { Logger } from './logger';
 import {
   isChatPayload,
@@ -41,6 +42,8 @@ export interface RoomSessionState {
   member?: RoomMember;
   /** member.permissions.can_control_playback. The server never enforces it (contract §4), so the client must. */
   canControl: boolean;
+  /** member.permissions.can_send_messages. The hub relays chat from a muted member anyway (sendChat), so the client must enforce it. */
+  canChat: boolean;
   /** Undefined until the first SYNC_PLAYBACK. */
   playback?: PlaybackState;
   /** Device clock minus server clock, refreshed from each SYNC_PLAYBACK. */
@@ -64,7 +67,7 @@ export type RoomAction =
 const LIVE_NOTICE: RoomNotice = { kind: 'live-unsupported', message: "Live channels aren't available on TV yet" };
 
 export function initialRoomState(roomId: string, me: { userId: string; username: string }): RoomSessionState {
-  return { roomId, me, canControl: false, clockOffsetMs: 0, chat: [], roster: [], viewers: [], connection: 'idle' };
+  return { roomId, me, canControl: false, canChat: false, clockOffsetMs: 0, chat: [], roster: [], viewers: [], connection: 'idle' };
 }
 
 /**
@@ -91,6 +94,7 @@ export function isWellFormed(msg: WSMessage): boolean {
   }
 }
 
+/** Appends unseen messages; returns `existing` itself when nothing was new. */
 function mergeChat(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
   const seen = new Set(existing.map((m) => m.id));
   const merged = existing.slice();
@@ -99,6 +103,7 @@ function mergeChat(existing: ChatMessage[], incoming: ChatMessage[]): ChatMessag
     seen.add(m.id);
     merged.push(m);
   }
+  if (merged.length === existing.length) return existing;
   return merged.length > CHAT_CAP ? merged.slice(-CHAT_CAP) : merged;
 }
 
@@ -127,6 +132,7 @@ export function roomReducer(s: RoomSessionState, a: RoomAction): RoomSessionStat
         room: a.room,
         member: a.member,
         canControl: a.member.permissions.can_control_playback,
+        canChat: a.member.permissions.can_send_messages,
         chat: mergeChat(s.chat, a.history),
         notice: s.notice?.kind === 'enter-failed' ? undefined : s.notice,
       };
@@ -158,9 +164,14 @@ function reduceWs(s: RoomSessionState, msg: WSMessage, now: number): RoomSession
       // Before the first SYNC_PLAYBACK there is nothing to apply a delta to; the sync supersedes it.
       if (!s.playback || isOwnEcho(msg, s.me.userId)) return s;
       return withPlayback(s, applyRemote(s.playback, msg, now, s.clockOffsetMs));
-    case 'CHAT_MESSAGE':
-      // Own messages are rendered from the echo too (contract §4, Chat).
-      return { ...s, chat: mergeChat(s.chat, [chatFromWs(msg as WSMessage<{ message: string }>, s.roomId)]) };
+    case 'CHAT_MESSAGE': {
+      // Own messages are rendered from the echo too (contract §4, Chat). The hub relays the raw
+      // payload, untrimmed; Inox's web client skips empty ones (useChat.ts).
+      const m = msg as WSMessage<{ message: string }>;
+      if (!trimChat(m.payload?.message ?? '')) return s;
+      const chat = mergeChat(s.chat, [chatFromWs(m, s.roomId)]);
+      return chat === s.chat ? s : { ...s, chat };
+    }
     case 'SFU_PEERS':
       return { ...s, roster: ((msg.payload as { peers: SfuPeer[] | null }).peers ?? []).slice() };
     case 'JOIN_ROOM':
@@ -172,12 +183,17 @@ function reduceWs(s: RoomSessionState, msg: WSMessage, now: number): RoomSession
   }
 }
 
-/** What happened, for the UI: `playback` means the player should be re-aligned (RoomScreen.applyNow). */
-export type RoomEvent = { type: 'state' } | { type: 'playback'; reason: string };
+/**
+ * What happened, for the UI; every event comes with the new state. `playback` means the player
+ * should be re-aligned (RoomScreen.applyNow); `chat` is a live message just added (not history,
+ * not a duplicate), in place of `state`.
+ */
+export type RoomEvent = { type: 'state' } | { type: 'playback'; reason: string } | { type: 'chat'; message: ChatMessage };
 
 export type SendResult = 'sent' | 'forbidden' | 'offline' | 'not-ready';
+export type ChatSendResult = SendResult | 'empty' | 'too-long' | 'throttled';
 
-type SocketLike = Pick<RoomSocket, 'connect' | 'close' | 'send' | 'onMessage' | 'onState'>;
+type SocketLike = Pick<RoomSocket, 'connect' | 'close' | 'send' | 'onMessage' | 'onState' | 'retryNow'>;
 
 export interface RoomSessionDeps {
   api: Pick<Api, 'joinRoom' | 'getRoom' | 'getMessages'>;
@@ -195,12 +211,20 @@ export function createRoomSession(roomId: string, me: { userId: string; username
   let state = initialRoomState(roomId, me);
   let socket: SocketLike | null = null;
   let left = false;
+  let lastChatAt: number | null = null;
   const listeners = new Set<(s: RoomSessionState, e: RoomEvent) => void>();
+
+  function eventFor(action: RoomAction, next: RoomSessionState, reason: string): RoomEvent {
+    if (next.playback !== state.playback) return { type: 'playback', reason };
+    // mergeChat appends, so a live frame that changed the chat added its last entry.
+    const added = action.type === 'ws' && next.chat !== state.chat ? next.chat.at(-1) : undefined;
+    return added ? { type: 'chat', message: added } : { type: 'state' };
+  }
 
   function dispatch(action: RoomAction, reason: string = action.type): void {
     const next = roomReducer(state, action);
     if (next === state) return;
-    const event: RoomEvent = next.playback !== state.playback ? { type: 'playback', reason } : { type: 'state' };
+    const event = eventFor(action, next, reason);
     state = next;
     for (const cb of listeners) cb(state, event);
   }
@@ -245,6 +269,11 @@ export function createRoomSession(roomId: string, me: { userId: string; username
       return true;
     },
 
+    /** The Retry button: reconnect now instead of waiting out the backoff (RoomSocket.retryNow). */
+    retryConnection(): void {
+      socket?.retryNow();
+    },
+
     leave(): void {
       left = true;
       socket?.close();
@@ -259,6 +288,24 @@ export function createRoomSession(roomId: string, me: { userId: string; username
       if (!socket?.send(type, { media_time_seconds: position })) return 'offline';
       const isPlaying = type === 'PLAY' ? true : type === 'PAUSE' ? false : playback.isPlaying;
       dispatch({ type: 'local-playback', isPlaying, position, localNowMs: deps.now() }, `local ${type}`);
+      return 'sent';
+    },
+
+    /**
+     * A chat line, reaction or quick reply (D17). Not optimistic: it shows when the hub echoes it
+     * back, like everyone else's. Inox's hub broadcasts every CHAT_MESSAGE and only skips saving it
+     * when the sender lacks can_send_messages (ws/hub.go dispatchLocal → room/chat_service.go
+     * SaveMessage), so a muted member's message would still reach the room: the check is ours.
+     */
+    sendChat(text: string): ChatSendResult {
+      if (!state.member) return 'not-ready';
+      if (!state.canChat) return 'forbidden';
+      const check = checkChatText(text);
+      if (!check.ok) return check.reason;
+      const now = deps.now();
+      if (lastChatAt !== null && now - lastChatAt < CHAT_MIN_INTERVAL_MS) return 'throttled';
+      if (!socket?.send('CHAT_MESSAGE', { message: check.text })) return 'offline';
+      lastChatAt = now;
       return 'sent';
     },
 

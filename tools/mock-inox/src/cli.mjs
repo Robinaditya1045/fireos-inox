@@ -4,6 +4,9 @@
 //                                    [--control] [--no-rate-limit] [--fixtures DIR]
 // Control API (with --control): POST /__control/{drop-sockets|expire-sessions|latency?ms=|malformed|
 //   send?type=&t=|make-leader?user=|slow-hls?ms=|hls-404|reset}, GET /__control/events.
+//   POST /__control/permissions?user=<id|username|email>&can_send_messages=false (any permission flag,
+//   true|false) edits a member's permissions, as a host would in the web UI; reset restores role defaults.
+//   Chat is fanned out even from a muted member but only saved when allowed (ws/hub.go, room/chat_service.go).
 import { DEFAULT_PORT, startMock } from './mock.mjs';
 
 const args = process.argv.slice(2);
