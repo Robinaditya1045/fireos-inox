@@ -3,7 +3,7 @@ import {ScrollView, StyleSheet, Text, View} from 'react-native';
 import {checkCustomUrl, formatDuration, libraryEntries, maxResolution, playUrl, titleFromUrl, type MediaAsset} from '../../../../packages/core/src';
 import {logger} from '../platform/logger';
 import {api} from '../platform/services';
-import {color, font, space} from '../theme/tokens';
+import {color, font, layer, space} from '../theme/tokens';
 import {FocusButton} from './FocusButton';
 import {UrlKeyboard} from './UrlKeyboard';
 
@@ -78,18 +78,20 @@ export const LibraryPanel = ({currentUrl, onChoose}: Props) => {
 
   return (
     <View style={styles.root}>
-      <Text style={styles.title}>Media Library</Text>
-      <Text style={styles.subtitle}>Choose what the whole room watches next.</Text>
-      <View style={styles.tabs}>
-        <FocusButton testID="library-tab-uploads" label={tab === 'uploads' ? '● Uploads' : 'Uploads'} onPress={() => setTab('uploads')} style={styles.tab} />
-        <FocusButton testID="library-tab-url" label={tab === 'url' ? '● Custom URL' : 'Custom URL'} onPress={() => setTab('url')} style={styles.tab} />
+      <Text style={styles.title} accessibilityRole="header">
+        Media Library
+      </Text>
+      <Text style={styles.subtitle}>Choose what the whole room watches next · Back closes</Text>
+      <View style={styles.tabs} accessibilityRole="tablist">
+        <FocusButton testID="library-tab-uploads" label="Uploads" compact selected={tab === 'uploads'} onPress={() => setTab('uploads')} style={styles.tab} />
+        <FocusButton testID="library-tab-url" label="Custom URL" compact selected={tab === 'url'} onPress={() => setTab('url')} style={styles.tab} />
       </View>
       {tab === 'url' ? (
         <UrlKeyboard value={url} onChange={setUrl} onSubmit={submitUrl} error={urlError} />
       ) : error ? (
         <>
           <Text style={styles.error}>{error}</Text>
-          <FocusButton testID="library-retry" label="Try again" onPress={() => void load()} hasTVPreferredFocus />
+          <FocusButton testID="library-retry" icon="↻" label="Try again" variant="primary" onPress={() => void load()} hasTVPreferredFocus style={styles.retry} />
         </>
       ) : assets === null ? (
         <Text style={styles.muted}>Loading library…</Text>
@@ -121,11 +123,26 @@ export const LibraryPanel = ({currentUrl, onChoose}: Props) => {
 };
 
 const styles = StyleSheet.create({
-  root: {position: 'absolute', top: 0, left: 0, bottom: 0, width: '40%', backgroundColor: color.bg, paddingHorizontal: space.xl, paddingVertical: space.safeY, zIndex: 4},
+  // 44% keeps the content as wide as before (the URL keyboard's rows) now that it starts at the safe margin.
+  root: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    bottom: 0,
+    width: '44%',
+    backgroundColor: color.bg,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderRightColor: color.border,
+    paddingLeft: space.safeX,
+    paddingRight: space.xl,
+    paddingVertical: space.safeY,
+    zIndex: layer.panel,
+  },
   title: {color: color.text, fontSize: font.heading, fontWeight: '700'},
   subtitle: {color: color.textMuted, fontSize: font.caption, marginTop: space.xs, marginBottom: space.lg},
   tabs: {flexDirection: 'row', gap: space.md, marginBottom: space.lg},
-  tab: {paddingVertical: space.sm, paddingHorizontal: space.lg},
+  tab: {paddingVertical: space.sm},
+  retry: {alignSelf: 'flex-start'},
   list: {gap: space.md, paddingVertical: space.sm},
   item: {marginHorizontal: space.sm},
   muted: {color: color.textMuted, fontSize: font.body},

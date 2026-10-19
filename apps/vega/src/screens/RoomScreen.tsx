@@ -1,5 +1,5 @@
-import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {BackHandler, StyleSheet, Text, View} from 'react-native';
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {BackHandler, StyleSheet, View, type LayoutChangeEvent} from 'react-native';
 import {KeplerVideoSurfaceView} from '@amazon-devices/react-native-w3cmedia';
 import {useTVEventHandler, type HWEvent} from '@amazon-devices/react-native-kepler';
 import {
@@ -7,9 +7,15 @@ import {
   createRoomSession,
   DRIFT_SEEK_THRESHOLD_S,
   expectedPosition,
+  isReaction,
   isTvPlayableScheme,
+  mediaTitle,
   RoomSocket,
   SETTLE_MS,
+  syncStatus,
+  trimChat,
+  type ChatMessage,
+  type MediaAsset,
   type PlaybackState,
   type Room,
   type RoomSession,
@@ -18,11 +24,23 @@ import {
   type WebSocketCtor,
 } from '../../../../packages/core/src';
 import {LibraryPanel} from '../components/LibraryPanel';
+import {ChatBubbles, type ChatBubblesHandle} from '../components/room/ChatBubbles';
+import {authorColor, ChatPanel} from '../components/room/ChatPanel';
+import {ConnectionBanner, type ConnectionMode} from '../components/room/ConnectionBanner';
+import {ControlBar, type PlaybackProgress} from '../components/room/ControlBar';
+import {DevHud} from '../components/room/DevHud';
+import {FloatingReactions, type FloatingReactionsHandle} from '../components/room/FloatingReactions';
+import {NoticeCard} from '../components/room/NoticeCard';
+import {ReactionTray} from '../components/room/ReactionTray';
+import {StatusBanner} from '../components/room/StatusBanner';
+import {Dialog} from '../components/ui/Dialog';
+import {Toast, type ToastMessage, type Tone} from '../components/ui/Toast';
+import {useTimedValue} from '../components/ui/useTimedValue';
 import {config} from '../platform/config';
 import {logger} from '../platform/logger';
 import {api, auth} from '../platform/services';
 import {VegaPlayer, type LevelInfo} from '../player/VegaPlayer';
-import {color, font, radius, space} from '../theme/tokens';
+import {layer, motion, space} from '../theme/tokens';
 
 const DRIFT_CHECK_MS = 1000;
 /** A paused player further off than this is re-pinned. */
@@ -73,6 +91,32 @@ const MEDIA_ERRORS: Record<number, string> = {
   3: "This video's format isn't supported on TV",
   4: "This video's format isn't supported on TV",
 };
+const MEDIA_ERROR_TITLE = "This video can't play on TV";
+/**
+ * Media URLs the player may load. Another member's CHANGE_MEDIA reaches ensureMedia unchecked (the
+ * hub relays payloads verbatim), so anything else (file:, content:, javascript:, …) is refused.
+ */
+const LOADABLE_URL = /^https?:\/\//i;
+const REFUSED_URL = 'Only http:// and https:// links can play';
+
+/**
+ * Overlays that own focus. One at a time: opening another replaces it, back closes it. While one
+ * is open the global key handler ignores navigation keys, so they only move focus inside it.
+ */
+type Overlay = 'none' | 'controls' | 'reactions' | 'chat' | 'library';
+/** VVD reports the centre key (KEY_ENTER) as 'enter'; TVTypes.d.ts documents 'select'. Both count. */
+const SELECT_KEYS = new Set(['select', 'enter']);
+const NAV_KEYS = new Set(['up', 'down', 'left', 'right', ...SELECT_KEYS]);
+/**
+ * The select press that opens an overlay must not also press the button that takes focus in it,
+ * nor may the press that closes one reopen the control bar. Whether Vega delivers a Pressable's
+ * press on key-down or key-up is [U], so presses this soon after an overlay change are dropped.
+ */
+const PRESS_GUARD_MS = 350;
+/** Continuous time without an open socket before the banner says "Can't reach Inox" (tv-ux.md). */
+const OFFLINE_AFTER_MS = 30_000;
+const NOT_CONNECTED = 'Not connected — try again in a moment';
+const CHAT_OFF = 'Chat is turned off for you in this room';
 
 export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Session; onLeave: () => void}) => {
   const player = useRef<VegaPlayer | null>(null);
@@ -92,23 +136,65 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
   const seekCheck = useRef<{from: number; target: number; at: number} | null>(null);
   const seekMisses = useRef(0);
   const [mediaNotice, setMediaNotice] = useState<string | null>(null);
+  /** Why the current video can't play (media element error); cleared by a media change or a ready player. */
+  const [mediaError, setMediaError] = useState<string | null>(null);
+  /** The player failed to start, so the room was never entered: shown like a failed enter. */
+  const [initFailed, setInitFailed] = useState(false);
+  /** The same, for the key handler (set together). */
+  const initFailedRef = useRef(false);
 
   const [view, setView] = useState<RoomSessionState | null>(null);
-  const [toast, setToast] = useState<string | null>(null);
-  const [chatOpen, setChatOpen] = useState(false);
-  const [libraryOpen, setLibraryOpen] = useState(false);
-  /** Read by the key handler: while the library is open, keys move focus in it and nothing else. */
-  const libraryOpenRef = useRef(false);
-  libraryOpenRef.current = libraryOpen;
-  const [hud, setHud] = useState({expected: 0, actual: 0, drift: 0, playing: false});
+  /** drift is NaN until the drift loop has measured one, so the sync pill starts hidden. */
+  const [hud, setHud] = useState({expected: 0, actual: 0, drift: NaN, playing: false});
   const [level, setLevel] = useState<LevelInfo | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [toast, showToastMessage] = useTimedValue<ToastMessage>(motion.toastMs);
 
-  const showToast = useCallback((text: string) => {
-    setToast(text);
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setToast(null), 3000);
+  const [overlay, setOverlayState] = useState<Overlay>('none');
+  /** Read by the key and back handlers; updated before the re-render so a press in flight sees it. */
+  const overlayRef = useRef<Overlay>('none');
+  const overlayChangedAt = useRef(0);
+  /** Bumped on every remote key: re-shows the status banner and restarts the overlays' hide timers. */
+  const [keyTick, setKeyTick] = useState(0);
+  /** Height taken by the open bottom overlay (control bar, tray); bubbles, reactions and toasts sit above it. */
+  const [bottomInset, setBottomInset] = useState(0);
+  const [media, setMedia] = useState<MediaAsset[]>([]);
+  /** The socket has been open at least once: later outages say "Reconnecting…", not "Connecting…". */
+  const [everOpen, setEverOpen] = useState(false);
+  const [offline, setOffline] = useState(false);
+  const [retryEpoch, setRetryEpoch] = useState(0);
+  /** Since when the socket has not been open (mount counts); null while open. */
+  const downSince = useRef<number | null>(Date.now());
+  const lastRetryAt = useRef(0);
+  const left = useRef(false);
+  const floats = useRef<FloatingReactionsHandle>(null);
+  const bubbles = useRef<ChatBubblesHandle>(null);
+
+  const showToast = useCallback((text: string, tone: Tone = 'info') => showToastMessage({text, tone}), [showToastMessage]);
+
+  const setOverlay = useCallback((next: Overlay) => {
+    if (overlayRef.current === next) return;
+    overlayRef.current = next;
+    overlayChangedAt.current = Date.now();
+    if (next !== 'controls' && next !== 'reactions') setBottomInset(0);
+    if (next === 'chat') bubbles.current?.clear(); // the panel shows them
+    setOverlayState(next);
+    logger.info('ui', 'overlay', {overlay: next});
   }, []);
+  const closeOverlay = useCallback(() => setOverlay('none'), [setOverlay]);
+
+  /** False (and logged) for a press that arrives right after an overlay opened or closed. */
+  const pressReady = useCallback((what: string) => {
+    if (Date.now() - overlayChangedAt.current >= PRESS_GUARD_MS) return true;
+    logger.debug('keys', 'press guarded', {what});
+    return false;
+  }, []);
+
+  const leave = useCallback(() => {
+    if (left.current) return;
+    left.current = true;
+    logger.info('room', 'back → lobby');
+    onLeave();
+  }, [onLeave]);
 
   /**
    * Moves the player to where the room is right now.
@@ -221,13 +307,47 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
   }, []);
 
   const ensureMedia = useCallback((url: string) => {
+    if (url && !LOADABLE_URL.test(url)) {
+      // Never loaded. Clearing the playback ref keeps applyNow (called right after this) and the drift
+      // loop idle, so the previous video stays paused instead of following this one's timeline; the
+      // next playback event for a loadable URL sets it again and switches as usual.
+      state.current = null;
+      player.current?.pause();
+      if (loadedUrl.current !== url) {
+        loadedUrl.current = url;
+        seekCheck.current = null;
+        seekMisses.current = 0;
+        setMediaNotice(null);
+        setMediaError(REFUSED_URL);
+        logger.warn('room', 'refused media url', {scheme: url.slice(0, Math.max(0, url.indexOf(':'))).slice(0, 16), length: url.length});
+      }
+      return;
+    }
     if (!player.current || !url || loadedUrl.current === url) return;
     loadedUrl.current = url;
     seekCheck.current = null;
     seekMisses.current = 0;
     setMediaNotice(unseekableUrls.has(url) ? UNSEEKABLE_NOTICE : null);
+    setMediaError(null);
     void player.current.switchTo(url);
   }, []);
+
+  /** Live chat (not history): reactions float, other people's lines show as bubbles (D17). */
+  const onChatMessage = useCallback(
+    (m: ChatMessage) => {
+      const own = m.user_id === session.user_id;
+      if (isReaction(m.message)) {
+        floats.current?.push({id: m.id, emoji: trimChat(m.message), name: own ? 'You' : m.username, nameColor: authorColor(m.user_id)});
+      } else if (!own && overlayRef.current !== 'chat') {
+        bubbles.current?.push({id: m.id, name: m.username, nameColor: authorColor(m.user_id), text: trimChat(m.message)});
+      }
+    },
+    [session.user_id],
+  );
+  const onChatRef = useRef(onChatMessage);
+  useEffect(() => {
+    onChatRef.current = onChatMessage;
+  }, [onChatMessage]);
 
   // Mount: player, then the room session (join → details + history → socket).
   useEffect(() => {
@@ -235,6 +355,7 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     player.current = p;
     loadedUrl.current = null; // a new player has nothing loaded, even if the ref survived a remount
     p.onReady(() => applyNow('player-ready'));
+    p.onReady(() => setMediaError(null)); // a rebuilt or recovered element plays again
     p.onLevel(setLevel);
     p.onBuffering((b) => {
       if (b) settleUntil.current = Date.now() + SETTLE_MS;
@@ -242,8 +363,8 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     p.onError((code) => {
       const url = state.current?.mediaUrl ?? '';
       // Someone else may have picked an http:// file, which Vega's player refuses (D16).
-      if (url && !isTvPlayableScheme(url)) showToast('The TV plays video files only from https:// links');
-      else showToast(MEDIA_ERRORS[code ?? 0] ?? "Couldn't play this video");
+      if (url && !isTvPlayableScheme(url)) setMediaError('The TV plays video files only from https:// links');
+      else setMediaError(MEDIA_ERRORS[code ?? 0] ?? "Couldn't play this video");
     });
 
     const rs = createRoomSession(room.id, {userId: session.user_id, username: session.username}, {
@@ -287,6 +408,9 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       ensureMedia(st.playback.mediaUrl);
       applyNow(event.reason);
     });
+    rs.subscribe((_st, event) => {
+      if (event.type === 'chat') onChatRef.current(event.message);
+    });
 
     (async () => {
       await p.init();
@@ -295,15 +419,21 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
         const m = rs.getState().member;
         logger.info('room', 'entered', {room: room.name, role: m?.role, canControl: rs.getState().canControl});
       }
-    })();
+    })().catch((err) => {
+      // rs.enter() reports its own failures; this is the player (init/attach) failing first.
+      logger.error('room', 'init failed', {err: String(err)});
+      initFailedRef.current = true;
+      setInitFailed(true);
+    });
 
     return () => {
       rs.leave();
       roomSession.current = null;
       void p.destroy();
       player.current = null;
+      alignGen.current += 1; // pending hold polls/starts see a new generation and stop
     };
-  }, [applyNow, ensureMedia, showToast, room.id, room.name, session.id, session.user_id, session.username]);
+  }, [applyNow, ensureMedia, room.id, room.name, session.id, session.user_id, session.username]);
 
   /**
    * Drift loop, every second: R17 watchdog first, then seek-only correction through a hold.
@@ -380,20 +510,28 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     return () => clearInterval(t);
   }, [applyNow]);
 
+  // Library titles, once, to name what is playing; the banner falls back to a URL-derived title.
+  useEffect(() => {
+    let alive = true;
+    api
+      .listMedia()
+      .then((list) => {
+        if (alive) setMedia(list);
+      })
+      .catch((err) => logger.debug('room', 'media titles unavailable', {err: String(err)}));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
-      if (libraryOpen) {
-        setLibraryOpen(false);
-      } else if (chatOpen) {
-        setChatOpen(false);
-      } else {
-        logger.info('room', 'back → lobby');
-        onLeave();
-      }
+      if (overlayRef.current !== 'none') setOverlay('none');
+      else leave();
       return true;
     });
     return () => sub.remove();
-  }, [chatOpen, libraryOpen, onLeave]);
+  }, [leave, setOverlay]);
 
   const sendPlayback = useCallback(
     (type: 'PLAY' | 'PAUSE' | 'SEEK', position: number) => {
@@ -402,9 +540,9 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
       const result = rs.sendPlayback(type, position);
       if (result === 'forbidden') {
         logger.info('room', 'control blocked (no permission)', {type});
-        showToast('Only the host can control playback');
+        showToast('Only the host can control playback', 'warning');
       } else if (result === 'offline') {
-        showToast('Not connected — try again in a moment');
+        showToast(NOT_CONNECTED, 'warning');
       } else if (result === 'sent') {
         logger.info('room', `sent ${type}`, {position});
       }
@@ -413,80 +551,220 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
     [showToast],
   );
 
+  /** Play/pause key and the control bar's Play/Pause. */
+  const togglePlayback = useCallback(() => {
+    const p = player.current;
+    const s = state.current;
+    if (p && s) sendPlayback(s.isPlaying ? 'PAUSE' : 'PLAY', p.currentTime());
+  }, [sendPlayback]);
+
+  /** Rewind/fast-forward keys and the control bar's −/+ buttons. */
+  const seekBy = useCallback(
+    (deltaS: number) => {
+      const p = player.current;
+      if (p) sendPlayback('SEEK', Math.max(0, p.currentTime() + deltaS));
+    },
+    [sendPlayback],
+  );
+
   const chooseMedia = useCallback(
     (url: string, title: string) => {
       const rs = roomSession.current;
       if (!rs) return;
       // Re-picking the current title would restart it for everyone; on a remote that is a mis-press.
       if (url === state.current?.mediaUrl) {
-        setLibraryOpen(false);
+        setOverlay('none');
         showToast('Already playing');
         return;
       }
       const result = rs.changeMedia(url);
       if (result === 'forbidden') {
-        setLibraryOpen(false);
-        showToast("Only the host can change what's playing");
+        setOverlay('none');
+        showToast("Only the host can change what's playing", 'warning');
       } else if (result === 'offline' || result === 'not-ready') {
-        showToast('Not connected — try again in a moment');
+        showToast(NOT_CONNECTED, 'warning');
       } else {
         logger.info('room', 'sent CHANGE_MEDIA', {title});
-        setLibraryOpen(false);
-        showToast(`Now playing: ${title}`);
+        setOverlay('none');
+        showToast(`Now playing: ${title}`, 'success');
       }
       // 'sent' re-anchors the session at 0, paused; its playback event loads the URL (ensureMedia).
     },
-    [showToast],
+    [setOverlay, showToast],
   );
+
+  /** Inox only offers the library to members who can control playback. */
+  const openLibrary = useCallback(() => {
+    if (roomSession.current?.getState().canControl) setOverlay('library');
+    else showToast("Only the host can change what's playing", 'warning');
+  }, [setOverlay, showToast]);
+
+  /** The tray only opens for members who may chat; the hub would relay a muted member's message (D17). */
+  const openReactions = useCallback(() => {
+    const st = roomSession.current?.getState();
+    if (!st?.member) showToast(NOT_CONNECTED, 'warning');
+    else if (!st.canChat) showToast(CHAT_OFF, 'warning');
+    else setOverlay('reactions');
+  }, [setOverlay, showToast]);
+
+  /** Debug: cycle the rendition (auto → 0 → 1 → 2) to prove ABR level switching. */
+  const cycleQuality = useCallback(() => {
+    levelCycle.current = (levelCycle.current + 1) % LEVEL_CYCLE.length;
+    player.current?.setLevel(LEVEL_CYCLE[levelCycle.current]);
+    showToast(`Quality: ${LEVEL_CYCLE[levelCycle.current] === -1 ? 'auto' : `level ${LEVEL_CYCLE[levelCycle.current]}`}`);
+  }, [showToast]);
+
+  /** A reaction or quick reply (D17). Not optimistic: it appears (and floats) from the server echo. */
+  const sendChat = useCallback(
+    (text: string, kind: 'reaction' | 'reply', from: 'tray' | 'panel') => {
+      const rs = roomSession.current;
+      if (!rs) return;
+      const result = rs.sendChat(text);
+      switch (result) {
+        case 'sent':
+          logger.info('room', 'sent CHAT_MESSAGE', {kind, from, text});
+          if (kind === 'reply' && from === 'tray') {
+            setOverlay('none');
+            showToast(`Sent: ${text}`, 'success');
+          }
+          break;
+        case 'forbidden':
+          logger.info('room', 'chat blocked (no permission)', {kind});
+          showToast(CHAT_OFF, 'warning');
+          break;
+        case 'offline':
+        case 'not-ready':
+          showToast(NOT_CONNECTED, 'warning');
+          break;
+        case 'throttled':
+          logger.debug('room', 'chat throttled', {kind}); // a held key: stay quiet
+          break;
+        default:
+          logger.warn('room', 'chat refused', {result});
+      }
+    },
+    [setOverlay, showToast],
+  );
+
+  // Overlay actions, guarded against the press that opened the overlay.
+  const barPlayPause = useCallback(() => pressReady('playpause') && togglePlayback(), [pressReady, togglePlayback]);
+  const barSeekBy = useCallback((d: number) => pressReady('seek') && seekBy(d), [pressReady, seekBy]);
+  const barReact = useCallback(() => pressReady('react') && openReactions(), [pressReady, openReactions]);
+  const barChat = useCallback(() => pressReady('chat') && setOverlay('chat'), [pressReady, setOverlay]);
+  const barLibrary = useCallback(() => pressReady('library') && openLibrary(), [pressReady, openLibrary]);
+  const barQuality = useCallback(() => pressReady('quality') && cycleQuality(), [pressReady, cycleQuality]);
+  const trayReaction = useCallback((emoji: string) => pressReady('reaction') && sendChat(emoji, 'reaction', 'tray'), [pressReady, sendChat]);
+  const trayReply = useCallback((text: string) => pressReady('reply') && sendChat(text, 'reply', 'tray'), [pressReady, sendChat]);
+  const panelReaction = useCallback((emoji: string) => pressReady('reaction') && sendChat(emoji, 'reaction', 'panel'), [pressReady, sendChat]);
+  const panelReply = useCallback((text: string) => pressReady('reply') && sendChat(text, 'reply', 'panel'), [pressReady, sendChat]);
+  const panelClose = useCallback(() => pressReady('close') && setOverlay('none'), [pressReady, setOverlay]);
+
+  const getProgress = useCallback(
+    (): PlaybackProgress => ({position: player.current?.currentTime() ?? 0, duration: player.current?.duration() ?? 0, playing: state.current?.isPlaying ?? false}),
+    [],
+  );
+  const onBottomLayout = useCallback((e: LayoutChangeEvent) => setBottomInset(e.nativeEvent.layout.height + space.md), []);
+
+  const connection = view?.connection ?? 'idle';
+  const enterFailed = initFailed || view?.notice?.kind === 'enter-failed';
+
+  // Socket banner: "Can't reach Inox" + Retry after OFFLINE_AFTER_MS without an open socket.
+  useEffect(() => {
+    if (connection === 'open') {
+      downSince.current = null;
+      setEverOpen(true);
+      setOffline(false);
+      return;
+    }
+    if (downSince.current === null) downSince.current = Date.now();
+    // Not while the room is still being joined (no socket to retry yet) or after it ended.
+    if (connection === 'idle' || connection === 'closed' || connection === 'unauthorized') return;
+    const t = setTimeout(() => setOffline(true), Math.max(0, OFFLINE_AFTER_MS - (Date.now() - downSince.current)));
+    return () => clearTimeout(t);
+  }, [connection, retryEpoch]);
+
+  const retry = useCallback(() => {
+    if (Date.now() - lastRetryAt.current < PRESS_GUARD_MS) return; // the button and the key handler both see one press
+    lastRetryAt.current = Date.now();
+    logger.info('room', 'retry connection');
+    downSince.current = Date.now();
+    setOffline(false);
+    setRetryEpoch((n) => n + 1);
+    roomSession.current?.retryConnection();
+  }, []);
 
   useTVEventHandler((evt: HWEvent) => {
     if (evt.eventKeyAction !== undefined && evt.eventKeyAction !== 0) return; // act on key-down only
-    const p = player.current;
-    const s = state.current;
     logger.debug('keys', 'event', {type: evt.eventType});
-    if (libraryOpenRef.current) return;
+    setKeyTick((n) => n + 1);
+    if (initFailedRef.current || roomSession.current?.getState().notice?.kind === 'enter-failed') {
+      if (SELECT_KEYS.has(evt.eventType)) leave(); // the dialog's only action; back works as well
+      return;
+    }
+    const open = overlayRef.current;
+    if (open !== 'none' && NAV_KEYS.has(evt.eventType)) return; // focus moves inside the overlay
     switch (evt.eventType) {
       // VVD delivers KEY_PLAYPAUSE as 'play' (not 'playpause' as TVTypes.d.ts documents).
       case 'playpause':
       case 'play':
       case 'pause':
-        if (p && s) sendPlayback(s.isPlaying ? 'PAUSE' : 'PLAY', p.currentTime());
+        togglePlayback();
         break;
       case 'rewind':
       case 'skip_backward':
-        if (p) sendPlayback('SEEK', Math.max(0, p.currentTime() - SEEK_STEP_S));
+        seekBy(-SEEK_STEP_S);
         break;
       case 'forward':
       case 'fastforward':
       case 'skip_forward':
-        if (p) sendPlayback('SEEK', p.currentTime() + SEEK_STEP_S);
+        seekBy(SEEK_STEP_S);
         break;
       case 'menu':
       case 'context_menu':
-        setChatOpen((o) => !o);
+        setOverlay(open === 'chat' ? 'none' : 'chat');
         break;
-      case 'down':
-        // Inox only offers the library to members who can control playback.
-        if (roomSession.current?.getState().canControl) setLibraryOpen(true);
-        else showToast("Only the host can change what's playing");
+      case 'select':
+      case 'enter':
+        if (Date.now() - overlayChangedAt.current < PRESS_GUARD_MS) break; // the press that just closed an overlay
+        if (offline) retry();
+        else setOverlay('controls');
         break;
       case 'up':
-        // Debug: cycle the rendition (auto → 0 → 1 → 2) to prove ABR level switching.
-        levelCycle.current = (levelCycle.current + 1) % LEVEL_CYCLE.length;
-        p?.setLevel(LEVEL_CYCLE[levelCycle.current]);
-        showToast(`Quality: ${LEVEL_CYCLE[levelCycle.current] === -1 ? 'auto' : `level ${LEVEL_CYCLE[levelCycle.current]}`}`);
+        openReactions();
+        break;
+      case 'down':
+        openLibrary();
         break;
       default:
         break;
     }
   });
 
-  const connection = view?.connection ?? 'idle';
+  const mediaUrl = view?.playback?.mediaUrl ?? '';
+  // A new video has no drift measured yet: hide the sync pill until the drift loop has one.
+  useEffect(() => {
+    setHud((h) => (Number.isNaN(h.drift) ? h : {...h, drift: NaN}));
+  }, [mediaUrl]);
+
+  const title = useMemo(() => mediaTitle(mediaUrl, media), [mediaUrl, media]);
   const chat = view?.chat ?? [];
   const roster = view?.roster ?? [];
-  const notice = view?.notice ? (view.notice.kind === 'live-unsupported' ? LIVE_NOTICE : view.notice.message) : null;
-  const ownerName = room.owner_id === session.user_id ? 'you' : 'the host';
-  const controlLine = view?.canControl ? 'You control playback' : `Following ${ownerName}`;
+  const canControl = view?.canControl ?? false;
+  const viewers = view?.viewers;
+  const hereCount = useMemo(() => new Set([...(viewers ?? []), session.user_id]).size, [viewers, session.user_id]);
+  const live = view?.playback?.kind === 'live';
+  const sync = !view?.playback || live || mediaNotice || mediaError ? null : syncStatus(hud.drift);
+  const connectionMode: ConnectionMode | null =
+    enterFailed || connection === 'open' || connection === 'closed' || connection === 'unauthorized'
+      ? null
+      : offline
+        ? 'offline'
+        : connection === 'idle'
+          ? null
+          : everOpen
+            ? 'reconnecting'
+            : 'connecting';
+  const centreNotice = live ? {title: LIVE_NOTICE, detail: null, tone: 'info' as const} : mediaError ? {title: MEDIA_ERROR_TITLE, detail: mediaError, tone: 'danger' as const} : null;
 
   return (
     <View style={styles.root}>
@@ -498,51 +776,69 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
         }}
         onSurfaceViewDestroyed={(h: string) => player.current?.detachSurface(h)}
       />
-      <View style={styles.banner}>
-        <Text style={styles.bannerTitle}>{room.name}</Text>
-        <Text style={styles.bannerSub}>
-          {controlLine}
-          {roster.length > 0 ? `  ·  🎧 ${roster.length} in voice` : ''}
-        </Text>
-      </View>
-      {connection === 'reconnecting' || connection === 'connecting' ? (
-        <View style={styles.connection}>
-          <Text style={styles.connectionText}>{connection === 'connecting' ? 'Connecting…' : 'Reconnecting…'}</Text>
+      <StatusBanner
+        roomName={room.name}
+        mediaTitle={title}
+        canControl={canControl}
+        sync={sync}
+        voiceCount={roster.length}
+        libraryHint={canControl}
+        wakeKey={keyTick}
+        pinned={overlay === 'controls'}
+      />
+      {__DEV__ || mediaNotice ? (
+        <View style={styles.topRight} pointerEvents="none">
+          {/* The chat panel takes the top-right corner; the dev HUD steps aside for it. */}
+          {__DEV__ && overlay !== 'chat' ? <DevHud connection={connection} hud={hud} level={level} /> : null}
+          {mediaNotice ? <NoticeCard title={mediaNotice} tone="warning" placement="inline" /> : null}
         </View>
       ) : null}
-      {__DEV__ ? (
-        <View style={styles.hud}>
-          <Text style={styles.hudText}>
-            {`ws ${connection} · ${hud.playing ? 'playing' : 'paused'} · room ${hud.expected.toFixed(1)}s · tv ${hud.actual.toFixed(1)}s · drift ${hud.drift.toFixed(2)}s`}
-          </Text>
-          <Text style={styles.hudText}>{level ? `rendition ${level.height}p (level ${level.index})` : 'rendition —'}</Text>
-        </View>
+      {centreNotice ? <NoticeCard title={centreNotice.title} detail={centreNotice.detail} tone={centreNotice.tone} placement="center" /> : null}
+      <ChatBubbles ref={bubbles} bottomInset={bottomInset} />
+      <FloatingReactions ref={floats} right={overlay === 'chat' ? '32%' : space.safeX} bottomInset={bottomInset} />
+      {connectionMode ? <ConnectionBanner key={`conn-${overlay}`} mode={connectionMode} showRetry={overlay === 'none'} onRetry={retry} /> : null}
+      {!enterFailed && overlay === 'controls' ? (
+        <ControlBar
+          getProgress={getProgress}
+          canControl={canControl}
+          seekStep={SEEK_STEP_S}
+          wakeKey={keyTick}
+          onIdle={closeOverlay}
+          onPlayPause={barPlayPause}
+          onSeekBy={barSeekBy}
+          onReact={barReact}
+          onChat={barChat}
+          onLibrary={canControl ? barLibrary : undefined}
+          onQuality={__DEV__ ? barQuality : undefined}
+          onLayout={onBottomLayout}
+        />
       ) : null}
-      {chatOpen ? (
-        <View style={styles.chat}>
-          <Text style={styles.chatTitle}>Chat</Text>
-          {chat.slice(-12).map((m) => (
-            <Text key={m.id} style={styles.chatLine}>
-              <Text style={styles.chatName}>{m.username}: </Text>
-              {m.message}
-            </Text>
-          ))}
-          {chat.length === 0 ? <Text style={styles.chatLine}>No messages yet</Text> : null}
-        </View>
+      {!enterFailed && overlay === 'reactions' ? (
+        <ReactionTray wakeKey={keyTick} onIdle={closeOverlay} onReaction={trayReaction} onQuickReply={trayReply} onLayout={onBottomLayout} />
       ) : null}
-      {libraryOpen ? <LibraryPanel currentUrl={view?.playback?.mediaUrl ?? ''} onChoose={chooseMedia} /> : null}
-      {notice ? (
-        <View style={styles.notice}>
-          <Text style={styles.noticeText}>{notice}</Text>
-        </View>
-      ) : mediaNotice ? (
-        <View style={styles.mediaNotice}>
-          <Text style={styles.noticeText}>{mediaNotice}</Text>
-        </View>
+      {!enterFailed && overlay === 'chat' ? (
+        <ChatPanel
+          messages={chat}
+          meId={session.user_id}
+          hereCount={hereCount}
+          voiceCount={roster.length}
+          canChat={view?.canChat ?? false}
+          onReaction={panelReaction}
+          onQuickReply={panelReply}
+          onClose={panelClose}
+        />
+      ) : null}
+      {!enterFailed && overlay === 'library' ? <LibraryPanel currentUrl={mediaUrl} onChoose={chooseMedia} /> : null}
+      {enterFailed ? (
+        <Dialog
+          title={view?.notice?.message ?? "Couldn't open this room"}
+          message={initFailed ? "The TV's video player didn't start. Go back and try again." : 'Go back and pick the room again.'}
+          actions={[{label: 'Back to rooms', onPress: leave, variant: 'primary', testID: 'room-back-to-rooms'}]}
+        />
       ) : null}
       {toast ? (
-        <View style={styles.toast}>
-          <Text style={styles.toastText}>{toast}</Text>
+        <View style={[styles.toastLayer, {bottom: bottomInset}]} pointerEvents="none">
+          <Toast message={toast} />
         </View>
       ) : null}
     </View>
@@ -551,21 +847,7 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
 
 const styles = StyleSheet.create({
   root: {flex: 1, backgroundColor: '#000'},
-  surface: {position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 0},
-  banner: {position: 'absolute', top: space.safeY, left: space.safeX, backgroundColor: color.overlay, borderRadius: radius.md, padding: space.md, zIndex: 2},
-  bannerTitle: {color: color.text, fontSize: font.heading, fontWeight: '700'},
-  bannerSub: {color: color.textMuted, fontSize: font.caption, marginTop: space.xs},
-  connection: {position: 'absolute', top: space.safeY, alignSelf: 'center', backgroundColor: color.overlay, borderRadius: radius.md, padding: space.md, zIndex: 3},
-  connectionText: {color: color.text, fontSize: font.body},
-  hud: {position: 'absolute', bottom: space.safeY, left: space.safeX, backgroundColor: color.overlay, borderRadius: radius.sm, padding: space.sm, zIndex: 2},
-  hudText: {color: color.text, fontSize: font.caption},
-  chat: {position: 'absolute', top: 0, right: 0, bottom: 0, width: '30%', backgroundColor: color.overlay, padding: space.lg, zIndex: 3},
-  chatTitle: {color: color.text, fontSize: font.heading, fontWeight: '700', marginBottom: space.md},
-  chatLine: {color: color.text, fontSize: font.caption, marginBottom: space.sm},
-  chatName: {color: color.accent, fontWeight: '700'},
-  notice: {position: 'absolute', top: '45%', alignSelf: 'center', backgroundColor: color.overlay, borderRadius: radius.md, padding: space.lg, zIndex: 4},
-  noticeText: {color: color.text, fontSize: font.body},
-  mediaNotice: {position: 'absolute', top: space.safeY, right: space.safeX, maxWidth: '40%', backgroundColor: color.overlay, borderRadius: radius.md, padding: space.md, zIndex: 2},
-  toast: {position: 'absolute', bottom: space.xxl * 2, alignSelf: 'center', backgroundColor: color.surfaceRaised, borderRadius: radius.md, padding: space.md, zIndex: 5},
-  toastText: {color: color.text, fontSize: font.body},
+  surface: {position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: layer.video},
+  topRight: {position: 'absolute', top: space.safeY, right: space.safeX, maxWidth: '40%', alignItems: 'flex-end', gap: space.sm, zIndex: layer.banner},
+  toastLayer: {position: 'absolute', top: 0, left: 0, right: 0, zIndex: layer.toast},
 });

@@ -19,6 +19,7 @@
     "release": "npm-run-all lint test build:app"
   },
   "dependencies": {
+    "@amazon-devices/react-native-async-storage__async-storage": "2.1.9000000000-rn-83",
     "@amazon-devices/react-native-kepler": "~4.0.0",
     "@amazon-devices/react-native-w3cmedia": "~2.3.2",
     "@xmldom/xmldom": "^0.9.12",
