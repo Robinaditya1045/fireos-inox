@@ -2,7 +2,7 @@
 // with Node's own fetch and WebSocket standing in for the platform's.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { startMock } from '../../../../tools/mock-inox/src/mock.mjs';
-import { createApi, createRoomSession, RoomSocket, type RoomEvent, type RoomSession, type Session, type WebSocketCtor } from '../../src';
+import { createApi, createRoomSession, libraryEntries, playUrl, RoomSocket, type RoomEvent, type RoomSession, type Session, type WebSocketCtor } from '../../src';
 import { fakeLogger } from '../helpers';
 
 type Mock = Awaited<ReturnType<typeof startMock>>;
@@ -124,6 +124,35 @@ describe('L2: core against mock-inox', () => {
     } finally {
       mock.setRole('couch', 'member');
     }
+  });
+
+  it('library: a moderator switches the media from the list and the room restarts paused at 0', async () => {
+    mock.setRole('couch', 'moderator');
+    try {
+      const host = await participant(hostEmail());
+      const tv = await participant(tvEmail());
+      expect(host.rs.sendPlayback('PLAY', 20)).toBe('sent');
+      await waitFor(() => tv.rs.getState().playback?.isPlaying, 3000, 'TV to play');
+      const entries = libraryEntries(await tv.api.listMedia());
+      expect(entries.map((a) => a.title)).toEqual(['Test Pattern (mock fixture)']);
+      const url = playUrl(entries[0]!);
+      expect(tv.rs.changeMedia(url)).toBe('sent');
+      const pb = await waitFor(() => (host.events.some((e) => e.type === 'playback' && e.reason === 'CHANGE_MEDIA') ? host.rs.getState().playback : undefined), 3000, 'host to get CHANGE_MEDIA');
+      expect(pb).toMatchObject({ mediaUrl: url, isPlaying: false, anchorTime: 0 });
+      const { room } = await host.api.getRoom(mock.roomId);
+      expect(room.current_media_url).toBe(url);
+    } finally {
+      mock.setRole('couch', 'member');
+    }
+  });
+
+  it('library: a member cannot switch the media and sends nothing', async () => {
+    const since = Date.now();
+    const tv = await participant(tvEmail());
+    expect(tv.rs.changeMedia('http://elsewhere/master.m3u8')).toBe('forbidden');
+    // The mock's event log outlives a test (the previous one sent a CHANGE_MEDIA as moderator).
+    const { events } = (await control('events')) as { events: { at: number; user_id: string; type: string }[] };
+    expect(events.filter((e) => e.at >= since && e.user_id === tv.me.userId && e.type === 'CHANGE_MEDIA')).toEqual([]);
   });
 
   it('drop-sockets: reconnects with backoff and resyncs from a fresh SYNC_PLAYBACK', async () => {

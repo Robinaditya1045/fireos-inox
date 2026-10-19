@@ -82,6 +82,11 @@ export function applyLocal(s: PlaybackState, isPlaying: boolean, position: numbe
   return { ...s, isPlaying, anchorTime: position, anchorLocalMs: localNowMs };
 }
 
+/** This client switched the media: the room restarts paused at 0 (ws/hub.go CHANGE_MEDIA). */
+export function applyLocalMedia(mediaUrl: string, localNowMs: number): PlaybackState {
+  return { mediaUrl, kind: 'vod', isPlaying: false, anchorTime: 0, anchorLocalMs: localNowMs };
+}
+
 export function expectedPosition(s: PlaybackState, localNowMs: number): number {
   return s.isPlaying ? s.anchorTime + (localNowMs - s.anchorLocalMs) / 1000 : s.anchorTime;
 }

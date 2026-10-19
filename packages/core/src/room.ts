@@ -14,6 +14,7 @@ import {
 import type { RoomSocket, SocketState } from './roomSocket';
 import {
   applyLocal,
+  applyLocalMedia,
   applyRemote,
   clockOffsetFromSync,
   declineLeadershipPayload,
@@ -57,7 +58,8 @@ export type RoomAction =
   | { type: 'enter-failed'; message: string }
   | { type: 'connection'; state: SocketState }
   | { type: 'ws'; msg: WSMessage; localNowMs: number }
-  | { type: 'local-playback'; isPlaying: boolean; position: number; localNowMs: number };
+  | { type: 'local-playback'; isPlaying: boolean; position: number; localNowMs: number }
+  | { type: 'local-media'; mediaUrl: string; localNowMs: number };
 
 const LIVE_NOTICE: RoomNotice = { kind: 'live-unsupported', message: "Live channels aren't available on TV yet" };
 
@@ -134,6 +136,8 @@ export function roomReducer(s: RoomSessionState, a: RoomAction): RoomSessionStat
       return s.connection === a.state ? s : { ...s, connection: a.state };
     case 'local-playback':
       return s.playback ? withPlayback(s, applyLocal(s.playback, a.isPlaying, a.position, a.localNowMs)) : s;
+    case 'local-media':
+      return s.playback ? withPlayback(s, applyLocalMedia(a.mediaUrl, a.localNowMs)) : s;
     case 'ws':
       return reduceWs(s, a.msg, a.localNowMs);
   }
@@ -255,6 +259,18 @@ export function createRoomSession(roomId: string, me: { userId: string; username
       if (!socket?.send(type, { media_time_seconds: position })) return 'offline';
       const isPlaying = type === 'PLAY' ? true : type === 'PAUSE' ? false : playback.isPlaying;
       dispatch({ type: 'local-playback', isPlaying, position, localNowMs: deps.now() }, `local ${type}`);
+      return 'sent';
+    },
+
+    /**
+     * Switches the whole room to another URL (the media library), paused at 0, as Inox's web client
+     * does (PlayerSyncProvider.tsx setMediaUrl): applied locally first, then broadcast.
+     */
+    changeMedia(mediaUrl: string): SendResult {
+      if (!state.playback) return 'not-ready';
+      if (!state.canControl) return 'forbidden';
+      if (!socket?.send('CHANGE_MEDIA', { media_url: mediaUrl, media_time_seconds: 0, is_playing: false })) return 'offline';
+      dispatch({ type: 'local-media', mediaUrl, localNowMs: deps.now() }, 'local CHANGE_MEDIA');
       return 'sent';
     },
   };

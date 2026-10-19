@@ -4,3 +4,4 @@ export * from './api';
 export * from './roomSocket';
 export * from './sync';
 export * from './room';
+export * from './library';

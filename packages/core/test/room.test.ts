@@ -286,6 +286,41 @@ describe('createRoomSession', () => {
     });
   });
 
+  describe('changeMedia', () => {
+    it('is forbidden without can_control_playback, and sends nothing', async () => {
+      const { rs, fs } = session(false);
+      await rs.enter();
+      fs.deliver(sync());
+      expect(rs.changeMedia('v')).toBe('forbidden');
+      expect(fs.sent).toEqual([]);
+      expect(rs.getState().playback?.mediaUrl).toBe('u');
+    });
+
+    it('is not-ready before SYNC_PLAYBACK, offline while the socket is down', async () => {
+      const { rs, fs } = session(true);
+      await rs.enter();
+      expect(rs.changeMedia('v')).toBe('not-ready');
+      fs.deliver(sync());
+      fs.drop();
+      expect(rs.changeMedia('v')).toBe('offline');
+      expect(rs.getState().playback?.mediaUrl).toBe('u');
+    });
+
+    it('sends the web client payload and restarts locally paused at 0; the echo is ignored', async () => {
+      const { rs, fs, events } = session(true);
+      await rs.enter();
+      fs.deliver(sync({ is_playing: true, media_time_seconds: 300 }));
+      events.length = 0;
+      expect(rs.changeMedia('v')).toBe('sent');
+      expect(fs.sent).toEqual([{ type: 'CHANGE_MEDIA', payload: { media_url: 'v', media_time_seconds: 0, is_playing: false } }]);
+      expect(rs.getState().playback).toMatchObject({ mediaUrl: 'v', kind: 'vod', isPlaying: false, anchorTime: 0 });
+      expect(events).toEqual([{ type: 'playback', reason: 'local CHANGE_MEDIA' }]);
+      const after = rs.getState();
+      fs.deliver(msg('CHANGE_MEDIA', { media_url: 'v', media_time_seconds: 0, is_playing: false }, { sender_id: 'me' }));
+      expect(rs.getState()).toBe(after);
+    });
+  });
+
   it('leave closes the socket', async () => {
     const { rs, fs } = session();
     await rs.enter();

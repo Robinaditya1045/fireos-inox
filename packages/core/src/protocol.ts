@@ -78,7 +78,8 @@ export interface MediaAsset {
   duration_seconds: number;
   thumbnail_url: string;
   hls_master_url: string;
-  renditions?: MediaRendition[];
+  /** Omitted when empty (domain/media.go omitempty); the mock sends null. */
+  renditions?: MediaRendition[] | null;
 }
 
 export interface ChatMessage {
