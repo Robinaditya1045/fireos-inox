@@ -311,7 +311,9 @@ describe('L2: Couch Reactions (D17)', () => {
     raw.send(JSON.stringify({ type: 'CHAT_MESSAGE', payload: { message: long }, timestamp: Date.now() + 1 }));
     raw.send(JSON.stringify({ type: 'CHAT_MESSAGE', payload: { message: `  ${tag}-ok  ` }, timestamp: Date.now() + 2 }));
     await waitFor(() => host.rs.getState().chat.find((m) => m.message === `  ${tag}-ok  `), 2000, 'untrimmed broadcast');
-    expect(host.rs.getState().chat.some((m) => m.message === long)).toBe(true);
+    // The long frame was relayed ahead of the -ok one (same socket, in order); the session drops it
+    // because Inox won't save it either.
+    expect(host.rs.getState().chat.some((m) => m.message === long)).toBe(false);
     raw.close();
     const saved = (await host.api.getMessages(mock.roomId, 100)).map((m) => m.message);
     expect(saved).not.toContain(tag);

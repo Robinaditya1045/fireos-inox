@@ -1,6 +1,8 @@
 # Isolated infrastructure for the local Inox backend (decision D6).
 # Non-default host ports and no container_name, so it runs beside Inox's own `make up`.
 # MinIO is intentionally absent: Inox falls back to local-disk storage when it is unreachable.
+# Ports bind to 127.0.0.1 only: the passwords below are public and Redis has no auth, and Docker's
+# published ports bypass ufw. Only the host-side Inox server uses them (devstack/env.template).
 name: fireos-inox-dev
 
 services:
@@ -11,7 +13,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: inox
     ports:
-      - "15432:5432"
+      - "127.0.0.1:15432:5432"
     volumes:
       - pg:/var/lib/postgresql/data
     healthcheck:
@@ -23,7 +25,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "16379:6379"
+      - "127.0.0.1:16379:6379"
     volumes:
       - redis:/data
     healthcheck:

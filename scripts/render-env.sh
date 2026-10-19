@@ -7,5 +7,13 @@ source "$(dirname "$0")/lib.sh"
 export DEV_HOST="${DEV_HOST:-localhost}"
 export FIREOS_ROOT
 mkdir -p "$DEVSTACK" "$DEVSTACK/storage" "$DEVSTACK/run"
-envsubst '${DEV_HOST} ${FIREOS_ROOT}' < "$FIREOS_ROOT/devstack/env.template" > "$DEVSTACK/env"
+# A random SESSION_SECRET per machine, kept across re-renders (a committed one would be public).
+secret_file="$DEVSTACK/session-secret"
+if [[ ! -s "$secret_file" ]]; then
+  (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$secret_file")
+fi
+SESSION_SECRET="$(cat "$secret_file")"
+export SESSION_SECRET
+(umask 077; envsubst '${DEV_HOST} ${FIREOS_ROOT} ${SESSION_SECRET}' < "$FIREOS_ROOT/devstack/env.template" > "$DEVSTACK/env")
+chmod 600 "$DEVSTACK/env"
 echo "wrote $DEVSTACK/env (DEV_HOST=$DEV_HOST)"

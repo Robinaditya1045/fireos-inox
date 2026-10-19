@@ -84,6 +84,8 @@ export class VegaPlayer {
   private mode: 'hls' | 'file' = 'hls';
   private surface: string | null = null;
   private resetting = false;
+  /** Set by destroy(); a reset() still in flight must not bring a player back to life. */
+  private destroyed = false;
   private hlsConfig: Record<string, unknown> = {};
   private ready = false;
   private readyListeners: Array<() => void> = [];
@@ -222,7 +224,7 @@ export class VegaPlayer {
    * hls.recoverMediaError() (player lab, .devstack/evidence/lab-inox-recovery.txt).
    */
   async reset(): Promise<void> {
-    if (this.resetting) return;
+    if (this.resetting || this.destroyed) return;
     this.resetting = true;
     logger.warn('player', 'resetting media element', {url: this.url});
     if (this.retryTimer) clearTimeout(this.retryTimer);
@@ -239,9 +241,20 @@ export class VegaPlayer {
     this.ready = false;
     try {
       await this.init();
+      // The room was left while the element was rebuilt (a media switch or an R17 recovery):
+      // tear the new one down instead of loading the video into a screen that is gone.
+      if (this.destroyed) {
+        await this.video?.deinitialize();
+        this.video = null;
+        global.gmedia = null;
+        return;
+      }
       if (this.surface) this.video?.setSurfaceHandle(this.surface);
       // The current URL, not the one at the start: a switchTo() during the rebuild must win.
       if (this.url) this.load(this.url, this.hlsConfig);
+    } catch (err) {
+      logger.error('player', 'reset failed', {err: String(err)});
+      if (!this.destroyed) this.errorListeners.forEach((cb) => cb(undefined));
     } finally {
       this.resetting = false;
     }
@@ -352,6 +365,7 @@ export class VegaPlayer {
   }
 
   async destroy(): Promise<void> {
+    this.destroyed = true;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
     try {

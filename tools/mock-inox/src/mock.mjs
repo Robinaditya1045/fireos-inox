@@ -389,13 +389,17 @@ export async function startMock(opts = {}) {
     if (faults.hls404 && rel.endsWith('master.m3u8')) return fail(res, 404, 'object not found');
     let size;
     try {
-      size = statSync(file).size;
+      const st = statSync(file);
+      if (!st.isFile()) return fail(res, 404, 'object not found'); // a directory would crash the read stream
+      size = st.size;
     } catch {
       return fail(res, 404, 'object not found');
     }
     const start = () => {
       res.writeHead(200, { 'Content-Type': CONTENT_TYPES[extname(file)] ?? 'application/octet-stream', 'Content-Length': size, 'Access-Control-Allow-Origin': '*' });
-      createReadStream(file).pipe(res);
+      createReadStream(file)
+        .on('error', () => res.destroy())
+        .pipe(res);
     };
     if (faults.slowHlsMs > 0 && !rel.endsWith('.m3u8')) setTimeout(start, faults.slowHlsMs);
     else start();

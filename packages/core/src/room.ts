@@ -1,5 +1,5 @@
 import type { Api } from './api';
-import { CHAT_MIN_INTERVAL_MS, checkChatText, trimChat } from './chat';
+import { CHAT_MIN_INTERVAL_MS, checkChatText } from './chat';
 import type { Logger } from './logger';
 import {
   isChatPayload,
@@ -77,6 +77,9 @@ export function initialRoomState(roomId: string, me: { userId: string; username:
 export function isWellFormed(msg: WSMessage): boolean {
   switch (msg.type) {
     case 'SYNC_PLAYBACK':
+      // Only the server sends it, without a sender (ws/hub.go registerClient); the hub stamps
+      // sender_id on every client frame (ws/client.go), so a member can't fake a targeted sync.
+      return !msg.sender_id && isPlaybackPayload(msg.payload);
     case 'PLAY':
     case 'PAUSE':
     case 'SEEK':
@@ -166,9 +169,10 @@ function reduceWs(s: RoomSessionState, msg: WSMessage, now: number): RoomSession
       return withPlayback(s, applyRemote(s.playback, msg, now, s.clockOffsetMs));
     case 'CHAT_MESSAGE': {
       // Own messages are rendered from the echo too (contract §4, Chat). The hub relays the raw
-      // payload, untrimmed; Inox's web client skips empty ones (useChat.ts).
+      // payload, even what Inox refuses to save (empty, over 2000 bytes, up to the 512 KB frame
+      // cap), so only what it would save is kept: 200 maximal frames would hold ~100 MB.
       const m = msg as WSMessage<{ message: string }>;
-      if (!trimChat(m.payload?.message ?? '')) return s;
+      if (!checkChatText(m.payload?.message ?? '').ok) return s;
       const chat = mergeChat(s.chat, [chatFromWs(m, s.roomId)]);
       return chat === s.chat ? s : { ...s, chat };
     }

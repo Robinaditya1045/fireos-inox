@@ -10,8 +10,9 @@
 .env.*
 !.env.example
 
-# Generated app config (contains local host/IP and, in dev, prefilled credentials)
-apps/*/src/platform/config.generated.ts
+# Generated app config: config.generated.ts (local API address) and devCredentials.generated.ts
+# (seeded TV user, prefilled in dev builds only)
+apps/*/src/platform/*.generated.ts
 
 # Dependencies
 node_modules/

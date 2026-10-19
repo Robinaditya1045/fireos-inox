@@ -89,6 +89,25 @@ describe('roomReducer', () => {
     expect(ws(s, msg('CHAT_MESSAGE', { message: ' \n ' }, { sender_id: 'host', timestamp: NOW }))).toBe(s);
   });
 
+  it('skips chat Inox would not save (over 2000 bytes)', () => {
+    const s = synced();
+    expect(ws(s, msg('CHAT_MESSAGE', { message: '😂'.repeat(501) }, { sender_id: 'host', timestamp: NOW }))).toBe(s);
+    expect(ws(s, msg('CHAT_MESSAGE', { message: '😂'.repeat(500) }, { sender_id: 'host', timestamp: NOW })).chat).toHaveLength(1);
+  });
+
+  it('drops a SYNC_PLAYBACK that carries a sender: only the server sends it, and without one', () => {
+    const s = synced();
+    expect(ws(s, sync({ media_time_seconds: 999 }), NOW).playback?.anchorTime).toBe(999);
+    const forged = { ...sync({ media_time_seconds: 999 }), sender_id: 'mallory', target_id: 'me' };
+    expect(ws(s, forged)).toBe(s);
+  });
+
+  it('drops playback payloads with a non-finite time', () => {
+    const s = synced();
+    expect(ws(s, msg('SEEK', { media_time_seconds: Infinity }, { sender_id: 'host', timestamp: NOW }))).toBe(s);
+    expect(ws(s, msg('SEEK', { media_time_seconds: NaN }, { sender_id: 'host', timestamp: NOW }))).toBe(s);
+  });
+
   it(`caps chat at ${CHAT_CAP}, keeping the newest`, () => {
     let s = synced();
     for (let i = 0; i < CHAT_CAP + 5; i++) s = ws(s, msg('CHAT_MESSAGE', { message: `m${i}` }, { sender_id: 'host', timestamp: NOW + i }));

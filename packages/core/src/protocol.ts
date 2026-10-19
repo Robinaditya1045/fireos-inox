@@ -154,7 +154,7 @@ export interface LivePositionPayload {
 export const PLAYBACK_EVENTS = new Set<WSEventType>(['PLAY', 'PAUSE', 'SEEK', 'CHANGE_MEDIA']);
 
 export function isPlaybackPayload(p: unknown): p is PlaybackPayload {
-  return typeof p === 'object' && p !== null && typeof (p as PlaybackPayload).media_time_seconds === 'number';
+  return typeof p === 'object' && p !== null && Number.isFinite((p as PlaybackPayload).media_time_seconds);
 }
 
 export function isChatPayload(p: unknown): p is ChatPayload {

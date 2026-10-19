@@ -68,7 +68,11 @@ export class RoomSocket {
     const ws = this.ws;
     this.ws = null;
     if (ws) {
+      // A frame or error arriving during the close must not reach a room screen that is gone.
       ws.onclose = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onopen = null;
       ws.close(1000, 'leaving room');
     }
     this.setState('closed');
