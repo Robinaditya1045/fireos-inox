@@ -115,7 +115,7 @@ const Key = ({id, label, onPress, grow, accent, preferred, compact}: KeyProps) =
         logger.debug('focus', 'button', {id});
       }}
       onBlur={() => setFocused(false)}
-      style={[styles.key, compact && styles.keyCompact, grow && styles.grow, accent && styles.accent, focused && styles.focused]}>
+      style={[styles.key, compact && styles.keyCompact, grow && styles.grow, focused && styles.focused, accent && styles.accent]}>
       <Text style={styles.keyLabel}>{label}</Text>
     </Pressable>
   );
@@ -142,7 +142,8 @@ const styles = StyleSheet.create({
   },
   keyCompact: {minHeight: size.keyHeightCompact},
   grow: {paddingHorizontal: space.xs},
-  accent: {backgroundColor: color.accent},
+  // After `focused` in the style list, so the action key keeps its fill (white text, AA) when focused.
+  accent: {backgroundColor: color.accentStrong},
   focused: {borderColor: color.text, backgroundColor: color.surfaceRaised, transform: [{scale: focus.scale}]},
   keyLabel: {color: color.text, fontSize: font.caption, fontWeight: '600'},
 });
