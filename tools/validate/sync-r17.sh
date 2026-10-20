@@ -8,14 +8,8 @@ cd "$ROOT"
 # shellcheck disable=SC1090
 source ~/vega/env
 LOG=.devstack/logs/app-all.log
-vega device terminate-app --appName com.fireosinox.tv.main >/dev/null 2>&1 || true
-sleep 1
 start=$(wc -l < "$LOG")
-vega device launch-app --appName com.fireosinox.tv.main >/dev/null
-sleep 14
-scripts/vvd.sh key KEY_ENTER   # sign in (prefilled dev user)
-sleep 4
-scripts/vvd.sh key KEY_ENTER   # first room
+tools/validate/enter-room.sh   # relaunch; sign in only if asked; enter the room
 sleep 8
 node tools/validate/browser-host.mjs tools/validate/sync-script-r17.json > ".devstack/logs/web-$1.log" 2>&1
 tail -n +"$((start + 1))" "$LOG" > ".devstack/logs/app-$1.log"

@@ -35,6 +35,10 @@ for (const line of app) {
   if (line.includes('SYNC_PLAYBACK') && ctx) offset = ctx.clockOffsetMs;
   if (line.includes('"POS"') || line.includes('[sync] POS')) tv.push(ctx);
   if (line.includes('REMOTE ') && ctx) remote.push({ type: line.match(/REMOTE (\w+)/)[1], ...ctx });
+  // Since createRoomSession (2026-10-17) a remote event is logged as "[sync] PLAY {…}" with no device
+  // time; devlog's host receive time (a few ms late) stands in for it.
+  const ev = line.match(/\[sync\] (PLAY|PAUSE|SEEK|CHANGE_MEDIA) \{/);
+  if (ev && offset !== null) remote.push({ type: ev[1], localNowMs: host + offset });
 }
 if (offset === null) throw new Error('no SYNC_PLAYBACK with clockOffsetMs in app log');
 const tvHost = tv.filter((s) => s && s.localNowMs).map((s) => ({ ...s, host: s.localNowMs - offset }));

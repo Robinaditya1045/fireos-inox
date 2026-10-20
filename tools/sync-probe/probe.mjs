@@ -4,6 +4,8 @@
 //   node tools/sync-probe/probe.mjs [--as host|tv] send <TYPE> '<json payload>'
 //     e.g. send CHAT_MESSAGE '{"message":"😂"}'   (a reaction, D17; any CHAT_MESSAGE text works)
 //   node tools/sync-probe/probe.mjs [--as host|tv] script <file.json>   # [{"at":ms,"type":..,"payload":..}]
+//   node tools/sync-probe/probe.mjs role member|moderator [--mute]   # as host: set the TV user's role;
+//     --mute also takes away can_send_messages (re-enter the room on the TV to pick it up)
 // Credentials and room come from .devstack/seed-credentials.json and .devstack/seed-output.json.
 // Each received event is printed as "<recvEpochMs> <json>".
 import { readFileSync } from 'node:fs';
@@ -31,6 +33,29 @@ const login = await fetch(`${API}/auth/login`, {
 if (!login.ok) throw new Error(`login failed: ${login.status} ${await login.text()}`);
 const session = (await login.json()).id;
 
+if (cmd === 'role') {
+  // PUT /rooms/{id}/members/{user_id}/role (api/handler/room.go AssignRole) needs can_manage_roles,
+  // so it runs as the host. Without `permissions` Inox applies the role's defaults; --mute sends those
+  // defaults (domain/room.go DefaultPermissionsForRole) with can_send_messages turned off.
+  const role = rest[0];
+  const defaults = {
+    member: { can_control_playback: false, can_stream_audio: true, can_stream_video: true, can_share_screen: false, can_send_messages: true, can_invite_users: false, can_kick_users: false, can_manage_roles: false },
+    moderator: { can_control_playback: true, can_stream_audio: true, can_stream_video: true, can_share_screen: true, can_send_messages: true, can_invite_users: true, can_kick_users: true, can_manage_roles: false },
+  }[role];
+  if (!defaults) {
+    console.error('usage: probe.mjs role member|moderator [--mute]');
+    process.exit(1);
+  }
+  const tv = JSON.parse(readFileSync(join(root, '.devstack', 'seed-credentials.json'), 'utf8')).tv;
+  const tvLogin = await fetch(`${API}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: tv.email, password: tv.password }) });
+  if (!tvLogin.ok) throw new Error(`tv login failed: ${tvLogin.status}`);
+  const tvUserId = (await tvLogin.json()).user_id;
+  const body = { role, ...(rest.includes('--mute') ? { permissions: { ...defaults, can_send_messages: false } } : {}) };
+  const res = await fetch(`${API}/rooms/${roomId}/members/${tvUserId}/role`, { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session}` }, body: JSON.stringify(body) });
+  console.log(`${res.status} ${await res.text()}`);
+  process.exit(res.ok ? 0 : 1);
+}
+
 const ws = new WebSocket(`${API.replace(/^http/, 'ws')}/rooms/${roomId}/ws?session_id=${session}`);
 const send = (type, payload) => {
   ws.send(JSON.stringify({ type, payload, timestamp: Date.now() }));
@@ -55,6 +80,6 @@ if (cmd === 'send') {
   }
   setTimeout(() => ws.close(), 3000);
 } else if (cmd !== 'listen') {
-  console.error('usage: probe.mjs [--as host|tv] listen | send TYPE JSON | script FILE');
+  console.error('usage: probe.mjs [--as host|tv] listen | send TYPE JSON | script FILE | role member|moderator [--mute]');
   process.exit(1);
 }
