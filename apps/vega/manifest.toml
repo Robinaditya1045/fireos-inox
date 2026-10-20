@@ -4,6 +4,8 @@ schema-version = 1
 title = "FireOS-Inox"
 version = "0.1.0"
 id = "com.fireosinox.tv"
+# 512×512 PNG under assets/image (Vega docs: manifest [package] icon).
+icon = "@image/app_icon.png"
 
 [os.version]
 min = "1.2"

@@ -31,11 +31,13 @@ export const ReactionTray = memo(({wakeKey, onIdle, onReaction, onQuickReply, on
             <EmojiKey key={emoji} testID={`reaction-${i}`} emoji={emoji} size="large" hasTVPreferredFocus={i === 0} onPress={() => onReaction(emoji)} />
           ))}
         </View>
-        <View style={styles.replies}>
-          {QUICK_REPLIES.map((text, i) => (
-            <FocusButton key={text} testID={`quick-reply-${i}`} label={text} accessibilityLabel={`Send: ${text}`} compact onPress={() => onQuickReply(text)} />
-          ))}
-        </View>
+        {[QUICK_REPLIES.slice(0, 3), QUICK_REPLIES.slice(3)].map((row, r) => (
+          <View key={r} style={styles.replies}>
+            {row.map((text, i) => (
+              <FocusButton key={text} testID={`quick-reply-${r * 3 + i}`} label={text} accessibilityLabel={`Send: ${text}`} compact onPress={() => onQuickReply(text)} />
+            ))}
+          </View>
+        ))}
       </TVFocusGuideView>
       <Text style={styles.hint}>Everyone in the room sees it · Back closes</Text>
     </View>

@@ -16,8 +16,12 @@ interface Props {
   libraryHint: boolean;
   /** Changes on every remote key: the banner re-appears and its hide timer restarts. */
   wakeKey: number;
-  /** Kept visible while true (the control bar is open). */
+  /** Kept visible while true (the control bar is open, or nothing is playing). */
   pinned: boolean;
+  /** What the room is doing; null while unknown or live. */
+  phase: 'playing' | 'paused' | 'ended' | null;
+  /** Adds "▲ React" to the hint row (members who may chat). */
+  reactHint: boolean;
 }
 
 /**
@@ -25,7 +29,7 @@ interface Props {
  * It fades out after motion.bannerHideMs without a key press and is unmounted once hidden, so
  * nothing sits over the video while idle.
  */
-export const StatusBanner = memo(({roomName, mediaTitle, canControl, sync, voiceCount, libraryHint, wakeKey, pinned}: Props) => {
+export const StatusBanner = memo(({roomName, mediaTitle, canControl, sync, voiceCount, libraryHint, wakeKey, pinned, phase, reactHint}: Props) => {
   const opacity = useRef(new Animated.Value(0)).current;
   const [visible, setVisible] = useState(true);
   const [mounted, setMounted] = useState(true);
@@ -51,7 +55,18 @@ export const StatusBanner = memo(({roomName, mediaTitle, canControl, sync, voice
   }, [visible, mounted, opacity]);
 
   if (!mounted) return null;
-  const hints = ['▲ React', '☰ Chat', 'OK Controls', ...(libraryHint ? ['▼ Library'] : [])].join('  ·  ');
+  const hints = [...(reactHint ? ['▲ React'] : []), '☰ Chat', 'OK Controls', ...(libraryHint ? ['▼ Library'] : [])].join('  ·  ');
+  // VVD draws no picture for a paused video that hasn't played yet, so say what is going on.
+  const waiting =
+    phase === 'paused'
+      ? canControl
+        ? 'Press ⏯ to start it for everyone'
+        : 'Waiting for the host to press play'
+      : phase === 'ended'
+        ? canControl
+          ? 'Press ▼ to pick what to watch next'
+          : 'Waiting for the host to pick what’s next'
+        : null;
   return (
     <Animated.View style={[styles.root, {opacity}]} accessibilityRole="header" accessibilityLabel={`${roomName}${mediaTitle ? `, playing ${mediaTitle}` : ''}`}>
       <Text style={styles.room} numberOfLines={1}>
@@ -64,10 +79,13 @@ export const StatusBanner = memo(({roomName, mediaTitle, canControl, sync, voice
       ) : null}
       <View style={styles.row}>
         <Text style={styles.control}>{canControl ? 'You control playback' : '🔒 Following the host'}</Text>
-        {sync === 'in-sync' ? <Pill icon="●" label="In sync" tone="success" /> : null}
-        {sync === 'catching-up' ? <Pill icon="↻" label="Catching up…" tone="warning" /> : null}
+        {phase === 'paused' ? <Pill icon="❚❚" label="Paused" /> : null}
+        {phase === 'ended' ? <Pill icon="■" label="Ended" /> : null}
+        {phase !== 'ended' && sync === 'in-sync' ? <Pill icon="●" label="In sync" tone="success" /> : null}
+        {phase !== 'ended' && sync === 'catching-up' ? <Pill icon="↻" label="Catching up…" tone="warning" /> : null}
         {voiceCount > 0 ? <Pill icon="🎧" label={`${voiceCount} in voice`} /> : null}
       </View>
+      {waiting ? <Text style={styles.waiting}>{waiting}</Text> : null}
       <Text style={styles.hint}>{hints}</Text>
     </Animated.View>
   );
@@ -90,5 +108,6 @@ const styles = StyleSheet.create({
   title: {color: color.text, fontSize: font.body},
   row: {flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: space.sm, marginTop: space.xs},
   control: {color: color.textMuted, fontSize: font.caption},
+  waiting: {color: color.text, fontSize: font.caption},
   hint: {color: color.textMuted, fontSize: font.caption, marginTop: space.xs},
 });

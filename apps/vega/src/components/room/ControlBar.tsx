@@ -1,6 +1,7 @@
 import React, {memo, useCallback, useEffect, useState} from 'react';
 import {StyleSheet, Text, View, type LayoutChangeEvent} from 'react-native';
 import {TVFocusGuideView} from '@amazon-devices/react-native-kepler';
+import {DRIFT_SEEK_THRESHOLD_S} from '../../../../../packages/core/src';
 import {color, font, layer, motion, radius, space} from '../../theme/tokens';
 import {FocusButton} from '../FocusButton';
 import {useIdleTimeout} from './useIdleTimeout';
@@ -12,6 +13,8 @@ export interface PlaybackProgress {
   duration: number;
   /** What the room is doing (not the local element, which may be holding). */
   playing: boolean;
+  /** Room position minus TV position at the last drift check, seconds; NaN while unknown. */
+  driftS: number;
 }
 
 interface Props {
@@ -33,6 +36,16 @@ interface Props {
 }
 
 const PROGRESS_REFRESH_MS = 1000;
+
+/** Sync made visible: how far the TV is from the room, from the drift loop's last sample. */
+const SyncReadout = ({driftS}: {driftS: number}) => {
+  const inSync = Math.abs(driftS) <= DRIFT_SEEK_THRESHOLD_S;
+  return (
+    <Text style={[styles.sync, {color: inSync ? color.success : color.warning}]} accessibilityLabel={`TV is ${Math.abs(driftS).toFixed(2)} seconds from the room`}>
+      {inSync ? `● In sync ±${Math.abs(driftS).toFixed(2)} s` : `↻ ${Math.abs(driftS).toFixed(1)} s off`}
+    </Text>
+  );
+};
 
 /** 0:05, 12:34, 1:02:03. */
 export function clock(seconds: number): string {
@@ -77,6 +90,7 @@ export const ControlBar = memo((props: Props) => {
           <View style={[styles.rest, {flex: 1 - fraction}]} />
         </View>
         <Text style={styles.time}>{known ? `${clock(position)} / ${clock(duration)}` : clock(position)}</Text>
+        {Number.isFinite(progress.driftS) ? <SyncReadout driftS={progress.driftS} /> : null}
       </View>
       <TVFocusGuideView style={styles.buttons} trapFocusUp trapFocusDown trapFocusLeft trapFocusRight>
         <FocusButton
@@ -143,6 +157,7 @@ const styles = StyleSheet.create({
   fill: {backgroundColor: color.accent, borderRadius: radius.sm},
   rest: {backgroundColor: 'transparent'},
   time: {color: color.text, fontSize: font.caption, fontVariant: ['tabular-nums']},
+  sync: {fontSize: font.caption, fontWeight: '600', fontVariant: ['tabular-nums']},
   buttons: {flexDirection: 'row', alignItems: 'center', gap: space.md},
   spacer: {flex: 1},
 });

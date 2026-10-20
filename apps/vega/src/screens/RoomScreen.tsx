@@ -659,10 +659,30 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
   const panelReply = useCallback((text: string) => pressReady('reply') && sendChat(text, 'reply', 'panel'), [pressReady, sendChat]);
   const panelClose = useCallback(() => pressReady('close') && setOverlay('none'), [pressReady, setOverlay]);
 
+  const hudRef = useRef(hud);
+  hudRef.current = hud;
   const getProgress = useCallback(
-    (): PlaybackProgress => ({position: player.current?.currentTime() ?? 0, duration: player.current?.duration() ?? 0, playing: state.current?.isPlaying ?? false}),
+    (): PlaybackProgress => ({
+      position: player.current?.currentTime() ?? 0,
+      duration: player.current?.duration() ?? 0,
+      playing: state.current?.isPlaying ?? false,
+      driftS: hudRef.current.drift,
+    }),
     [],
   );
+
+  // What the room is doing, for the banner: re-read twice a second rather than from the drift loop,
+  // which stays untouched (R17) and stops sampling once the room runs past the end of the media.
+  const [phase, setPhase] = useState<'playing' | 'paused' | 'ended' | null>(null);
+  useEffect(() => {
+    const t = setInterval(() => {
+      const s = state.current;
+      const p = player.current;
+      const next = !s || s.kind === 'live' ? null : p && p.duration() > 0 && expectedPosition(s, Date.now()) >= p.duration() - 0.5 ? 'ended' : s.isPlaying ? 'playing' : 'paused';
+      setPhase((prev) => (prev === next ? prev : next));
+    }, 500);
+    return () => clearInterval(t);
+  }, []);
   const onBottomLayout = useCallback((e: LayoutChangeEvent) => setBottomInset(e.nativeEvent.layout.height + space.md), []);
 
   const connection = view?.connection ?? 'idle';
@@ -784,12 +804,14 @@ export const RoomScreen = ({room, session, onLeave}: {room: Room; session: Sessi
         voiceCount={roster.length}
         libraryHint={canControl}
         wakeKey={keyTick}
-        pinned={overlay === 'controls'}
+        pinned={overlay === 'controls' || phase === 'paused' || phase === 'ended'}
+        phase={phase}
+        reactHint={view?.canChat ?? false}
       />
       {__DEV__ || mediaNotice ? (
         <View style={styles.topRight} pointerEvents="none">
-          {/* The chat panel takes the top-right corner; the dev HUD steps aside for it. */}
-          {__DEV__ && overlay !== 'chat' ? <DevHud connection={connection} hud={hud} level={level} /> : null}
+          {/* Dev diagnostics only with the control bar, so nothing extra sits on the video. */}
+          {__DEV__ && overlay === 'controls' ? <DevHud connection={connection} hud={hud} level={level} /> : null}
           {mediaNotice ? <NoticeCard title={mediaNotice} tone="warning" placement="inline" /> : null}
         </View>
       ) : null}

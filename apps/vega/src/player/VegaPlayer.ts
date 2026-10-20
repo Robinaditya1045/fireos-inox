@@ -50,6 +50,25 @@ function installPolyfills() {
   polyfillsInstalled = true;
 }
 
+/**
+ * Keeps the platform's media keys away from the player. With no Kepler Media Controls entry in the
+ * manifest, w3cmedia runs its legacy PlayerSession mode (MediaPlayer.js initialize), in which the
+ * system's player session plays, pauses and seeks the element itself on play/pause, FF and RW. In a
+ * watch party only RoomScreen's key handler may act: on VVD a member's refused play/pause still paused
+ * the TV (2026-10-20), and a plain play() on a paused player is what races and wedges here (R17).
+ * `isPlayerSessionEnabled` is a public static of w3cmedia's MediaPlayer, which isn't exported;
+ * VideoPlayer extends it, so it is reached through the prototype chain. Must run before the first
+ * element is created.
+ */
+function disablePlayerSession(): void {
+  const base = Object.getPrototypeOf(VideoPlayer) as {isPlayerSessionEnabled?: unknown};
+  if (typeof base.isPlayerSessionEnabled === 'boolean') {
+    base.isPlayerSessionEnabled = false;
+  } else {
+    logger.warn('player', 'w3cmedia PlayerSession flag not found; media keys may drive the player');
+  }
+}
+
 function timeRanges(r: {length: number; start(i: number): number; end(i: number): number} | undefined): number[][] {
   const out: number[][] = [];
   for (let i = 0; i < (r?.length ?? 0); i++) out.push([r.start(i), r.end(i)]);
@@ -94,6 +113,7 @@ export class VegaPlayer {
   private errorListeners: Array<(code: number | undefined) => void> = [];
 
   async init(): Promise<void> {
+    disablePlayerSession();
     this.video = new VideoPlayer();
     global.gmedia = this.video;
     await this.video.initialize();
