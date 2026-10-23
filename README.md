@@ -30,23 +30,99 @@ Run the [local Inox stack](#quick-start-b-local-inox-stack) (or the [mock](#quic
 
 ## Architecture
 
+### System view
+
 ```
- Vega Virtual Device                                   Host
-┌───────────────────────────────────┐   REST /api/v1   ┌─────────────────────────────────┐
-│ apps/vega   React Native for Vega │ ───────────────▶ │ Inox server (local, isolated)   │
-│  Boot · SignIn · Lobby · Room     │   WS /rooms/ws   │   or tools/mock-inox (reviewers)│
-│  VegaPlayer: W3C media + hls.js   │ ◀──────────────▶ │                                 │
-├───────────────────────────────────┤   HLS / MP4      │ Inox web client = 2nd viewer    │
-│ packages/core  pure TypeScript    │ ───────────────▶ │ tools/sync-probe = scripted one │
-│  protocol · api · RoomSocket ·    │                  └─────────────────────────────────┘
-│  sync · room store · chat · lobby │
+ Vega Virtual Device (VVD)                           Host machine (local, isolated)
+┌───────────────────────────────────┐  REST /api/v1/*  ┌─────────────────────────────────┐
+│ apps/vega   React Native for Vega │ ───────────────▶ │ inox-server :18080 (snapshot)   │
+│  Boot · SignIn · Lobby · Room     │ WS /rooms/{id}/ws│  ws.Hub · REST · /media/stream  │
+│  focus · remote keys · overlays   │ ◀──────────────▶ │                                 │
+│  VegaPlayer: W3C media + hls.js   │                  │ inox-worker (ffmpeg → HLS)      │
+├───────────────────────────────────┤  HLS / MP4 GET   └──────┬───────────────┬──────────┘
+│ packages/core  pure TypeScript    │ ───────────────▶        │               │
+│  protocol · api · roomSocket ·    │                  Postgres :15432   Redis :16379
+│  sync · room store · chat · lobby │                  (docker project fireos-inox-dev)
 └───────────────────────────────────┘
+          Inox web client :15173 (snapshot)  = second participant / host
+          tools/sync-probe (Node)            = scripted participant
+          tools/mock-inox (Node)             ← replaces the whole right side for tests and reviewers
 ```
+
+### Components
 
 - **`packages/core`** is platform-free TypeScript with zero runtime dependencies: Inox wire types and runtime guards, the REST client, a reconnecting `RoomSocket`, the sync maths, the room store (`roomReducer` + `createRoomSession`: join → details + history → socket, echo suppression, permission-gated sends, live-leadership decline, chat and reactions with Inox's own validation rules) and the lobby model. `fetch`, `WebSocket`, timers and the clock are injected, so the same code runs in Node tests and on the TV. 129 Vitest tests: unit (L1) and contract tests against the mock (L2).
 - **`apps/vega`** is the Vega app (RN 0.83 template, app id `com.fireosinox.tv`): screens, a 10-foot UI kit (design tokens, focus-safe buttons, toast, pill, dialog, skeletons), room overlays, remote key handling, and `VegaPlayer`, our adapter over the W3C media player and Amazon's hls.js build.
 - **`tools/mock-inox`** is a contract-faithful mock of the Inox REST + WebSocket subset the TV uses, with failure injection (drop sockets, expire sessions, latency, malformed frames, live leadership, permissions). Every faked behaviour cites the Inox source file it mirrors.
 - **`tools/sync-probe`**, **`tools/validate`** and **`tools/devlog`** are the scripted participant, the validation harness (sync analyser, remote-only walk, network kill, player bench) and the device log streamer.
+- **`devstack/`** and **`scripts/`** run the local Inox stack from a read-only snapshot, seed it, and write the app's git-ignored config.
+
+### Repository layout
+
+```
+packages/core/src/        platform-free TypeScript, zero runtime dependencies
+  protocol.ts             Inox wire types (snake_case, mirrored from Inox) + runtime guards
+  api.ts                  REST client (Bearer auth, timeout, {"error"} → ApiError, null lists → [])
+  roomSocket.ts           reconnecting WebSocket
+  sync.ts                 anchor model, clock offset, latency compensation, seek-only correction
+  room.ts                 room store: roomReducer + createRoomSession
+  chat.ts                 Couch Reactions: reactions, quick replies, Inox's chat validation rules
+  lobby.ts, library.ts    lobby rows, media library and Custom URL rules
+  logger.ts               logger interface
+apps/vega/src/
+  App.tsx                 switches Boot → SignIn → Lobby → Room (no navigation library)
+  screens/                BootScreen, SignInScreen, LobbyScreen, RoomScreen
+  components/             10-foot UI kit (ui/), room overlays (room/), LibraryPanel, UrlKeyboard
+  player/VegaPlayer.ts    PlayerAdapter over Amazon's hls.js sample (hlsjsplayer/)
+  platform/               services (API wiring), storage (AsyncStorage), config, logger
+  theme/tokens.ts         design tokens in px @1080p, scaled to Vega's 960×540 layout
+tools/mock-inox/          mock REST + WS backend with failure injection
+tools/sync-probe/         scripted room participant
+tools/validate/           sync analyser, remote-only walk, network kill, player bench
+tools/devlog/             streams app JS logs from the Metro inspector
+devstack/, scripts/       local Inox stack from a read-only snapshot, seeding, app config
+```
+
+**Boundary rule:** `packages/core` never imports `react-native`, `@amazon-devices/*`, hls.js or platform globals. `fetch`, `WebSocket`, timers, `now()` and the logger are injected, so core runs unchanged under Vitest in Node, against the mock and on the TV. The app imports core by relative path and Metro bundles it through `watchFolders`.
+
+### Core modules
+
+- **`protocol`**: TypeScript mirrors of Inox's `Session`, `User`, `Room`, `RoomMember`, `Permissions`, `MediaAsset`, `ChatMessage` and `WSMessage<T>` payloads. Every inbound WebSocket frame passes a narrow runtime guard; malformed frames are logged and dropped, never thrown.
+- **`api`**: `login`, `me`, `logout`, `listRooms`, `getRoom`, `joinRoom`, `listMedia`, `getMessages`. A `401` fires `onUnauthorized`, which routes the app to Sign-in.
+- **`RoomSocket`**: states `idle → connecting → open → reconnecting → closed | unauthorized`. It reconnects **forever** while the room screen is mounted (1 s → 15 s backoff, ±20 % jitter, reset after 10 s open), and checks `api.me()` first so an expired session goes to Sign-in instead of looping.
+- **`sync`**: pure functions. Playback is an **anchor** ("position X at local time T", extrapolated while playing), never a stored `currentTime`. A device-to-server clock offset comes from every `SYNC_PLAYBACK.timestamp` (the VVD runs about 0.9 s behind the host). PLAY latency compensation applies only when it is 0–5 s, as in the web client. `correction()` is seek-only, with a 0.5 s threshold.
+- **`room`**: `roomReducer` (pure) plus `createRoomSession(roomId, me, deps)`, which runs the room lifecycle, suppresses echoes, declines live leadership and exposes `subscribe((state, event) => …)`. `sendPlayback`, `changeMedia` and `sendChat` return `'sent' | 'forbidden' | 'offline' | 'not-ready'`, so the UI shows a toast instead of sending.
+- **`chat`**: reactions and quick replies are plain `CHAT_MESSAGE`s. The client enforces `can_send_messages`, 1–2000 UTF-8 bytes (Go-compatible trim) and a 1 s throttle, and drops relayed frames Inox wouldn't save.
+
+### Room lifecycle
+
+1. `POST /rooms/{id}/join` (without it the WebSocket handshake fails).
+2. `GET /rooms/{id}` and `GET /rooms/{id}/messages` in parallel.
+3. WebSocket connect, then wait for `SYNC_PLAYBACK` → `player.load(url)` → align to the expected position.
+4. Live events: `PLAY` / `PAUSE` / `SEEK` / `CHANGE_MEDIA` re-anchor playback; `CHAT_MESSAGE` feeds chat bubbles and floating reactions; a `LIVE_LEADER` naming the TV is answered with `LIVE_POSITION {unable: true}`, so a live room doesn't stall.
+5. Leaving the screen closes the socket but keeps the room membership.
+
+**Who sends what.** Only explicit key handlers send playback events; player callbacks never do. Own `PLAY` / `PAUSE` / `SEEK` / `CHANGE_MEDIA` echoes are dropped by `sender_id` (local actions apply optimistically), while own chat is rendered from the echo. The server doesn't enforce `can_control_playback`, so the client does. A `SYNC_PLAYBACK` carrying a `sender_id` is forged and dropped.
+
+### Player alignment (`RoomScreen` + `VegaPlayer`)
+
+- **Paused room:** pause and pin the exact position.
+- **Playing room:** if the player is already playing within 0.5 s with enough buffered, carry on. Otherwise **seek-ahead-and-hold**: pause, seek to `expected + lead` (the lead is learned from measured seek latency, 1–6 s), wait for buffered data, then `play()` exactly when the room reaches that frame.
+- **Drift loop (1 s):** a watchdog rebuilds the media element (`VegaPlayer.reset()`) when the playhead races ahead or freezes; otherwise seek-only correction above 0.5 s. `playbackRate` is never touched.
+- **Media modes:** HLS goes through hls.js (MSE); any other URL (MP4, MKV) plays in URL mode. A media switch rebuilds the player, because a used element never becomes ready for a second URL on the VVD.
+- **Recovery:** hls.js network errors retry with 2 s → 30 s backoff, media errors use `recoverMediaError`, and a socket reconnect resyncs from the server's fresh `SYNC_PLAYBACK`.
+
+### Failure handling
+
+| Failure | User sees | App does |
+|---|---|---|
+| Expired session (401 anywhere) | Sign-in, "Your session ended" | Clears the stored session |
+| Room join fails | Toast, back to the lobby | Logs status and body |
+| Socket drops | "Reconnecting…" banner; video keeps playing | Backoff loop, then resync |
+| Backend unreachable for 30 s | "Can't reach Inox · Retry" | Retry reconnects at once |
+| Media can't play | Room notice | Logged; details in the dev HUD |
+| Live media | "Live channels aren't available on TV yet" | Declines live leadership |
+| No playback / chat permission | Toast | Nothing is sent |
 
 ### Engineering notes
 
